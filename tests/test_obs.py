@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from rdefpy import read_observation, read_product
+from rdefpy import read_observation
 
 DATA = Path(__file__).parent / "data"
 
@@ -108,6 +108,7 @@ def test_str_repr(tmp_path):
 
 def test_datafile_reads(tmp_path):
     # Scan times match the product file the entry names.
+    read_product = pytest.importorskip("rdefpy.prd").read_product
     obs = read_observation(_write(tmp_path, OBS))
     entry = obs[0].products[0]
     pf = read_product(DATA / entry.datafile.name)

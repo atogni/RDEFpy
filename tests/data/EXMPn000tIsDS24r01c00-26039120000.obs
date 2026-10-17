@@ -1,0 +1,19 @@
+# Observation File
+V VERSION = 1
+# Simulated example, not a real observation.
+R STATION = DS24
+Z
+#
+# SCAN_NUM  SRC_ID     START_TIME         STOP_TIME          RA         DEC         TFREQ
+# ------------------------------------------------------------------------------------------
+S 001       EXMP       2026-039T12:00:00  2026-039T12:00:02  999        999         8400000000.0000
+#
+# DATAFILE                                COH_FLAG    DOR_MULT     FSUB           HARMONIC
+# ------------------------------------------------------------------------------------------
+D EXMPn001tSsDS24r01c01-26039120000.prd   T           0            0.0            0
+D EXMPn001tSsDS24r01c02-26039120000.prd   T           1/440        0.0            -1
+D EXMPn001tSsDS24r01c03-26039120000.prd   T           1/440        0.0            1
+D EXMPn001tSsDS24r01c04-26039120000.prd   T           1/440        0.0            -2
+D EXMPn001tSsDS24r01c05-26039120000.prd   T           1/440        0.0            2
+Z
+E *=END=*

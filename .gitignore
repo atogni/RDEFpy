@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+src/rdefpy/prd/unpack_cyth.c
+build/
+dist/
+*.egg-info/
+.venv/
+.pytest_cache/
+internal-testing/
+.vscode/
