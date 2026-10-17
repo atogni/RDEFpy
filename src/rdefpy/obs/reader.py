@@ -102,7 +102,46 @@ def _lines(path: Path) -> list[str]:
 
 
 def read_observation(path: str | Path) -> ObservationFile:
-    """Read an RDEF observation file (.obs)."""
+    """
+    Read an RDEF observation file (CCSDS 506.1-B-1 §4).
+
+    The file is checked strictly against §4: section order and ``Z``
+    terminators, single version/station lines, field formats and ranges
+    (Tables 4-1, 4-2), line length and characters (§4.1.3).  Any of the
+    four line terminators of §4.1.3 g is accepted, also mixed.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the ``.obs`` file.
+
+    Returns
+    -------
+    ObservationFile
+        Header fields, scans with their product file entries, and log lines.
+
+    Raises
+    ------
+    ValueError
+        The file breaks a rule of §4.  The message names the file and line,
+        the rule broken, and quotes the line.
+    OSError
+        The file cannot be read.
+
+    Notes
+    -----
+    Not checked: §6.2 file names (pattern, scan number or station in the
+    name against the file contents), and whether the product files exist.
+    A leap second (``hh:mm:60``) is valid time code but is rejected, as
+    ``numpy.datetime64`` cannot hold it.
+
+    Examples
+    --------
+    >>> obs = read_observation("session.obs")
+    >>> for scan in obs:
+    ...     for entry in scan.products:
+    ...         print(scan.scan_num, entry.datafile.name, entry.harmonic)
+    """
     path = Path(path)
     version = receive = transmit = None
     scans: list[Scan] = []

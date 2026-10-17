@@ -28,9 +28,28 @@ def _angle(v: float | None) -> str:
 
 @dataclass
 class ProductEntry:
-    """Product file line (Table 4-2).
+    """
+    One product file line (``D`` line) of a scan (CCSDS 506.1-B-1 Table 4-2).
 
-    ``datafile`` is resolved against the observation file's directory.
+    Each entry names the product file recorded for one frequency channel and
+    says how to compute that channel's tone frequency.
+
+    Attributes
+    ----------
+    datafile : Path
+        Product file name joined to the observation file's directory, so
+        ``read_product(entry.datafile)`` opens it wherever the caller runs.
+    coherent : bool
+        Coherence flag (``T``/``F``).  True: the tone frequency follows from
+        *dor_mult* and *harmonic*.  False: from *fsub* and *harmonic*.
+    dor_mult : Fraction
+        Fundamental tone as a fraction of the scan's TFREQ, e.g. ``1/440``,
+        when *coherent*.  Any number is allowed otherwise.
+    fsub : float
+        Fundamental subcarrier frequency in Hz, when not *coherent*.  When
+        *coherent* the spec allows any value; a non-numeric one is NaN.
+    harmonic : int
+        Subcarrier or coherent tone harmonic number.
     """
 
     datafile: Path
@@ -42,10 +61,28 @@ class ProductEntry:
 
 @dataclass(repr=False)
 class Scan:
-    """Scan line (Table 4-1) and its product file lines.
+    """
+    One scan section: the scan line (``S`` line, CCSDS 506.1-B-1 Table 4-1)
+    and its product file entries.
 
-    ``ra``/``dec`` are degrees, ``None`` when the file gives 999.
-    ``tfreq`` is Hz, 0 for a quasar.
+    ``print(scan)`` shows every field and one line per product file.
+
+    Attributes
+    ----------
+    scan_num : int
+        Scan number, 1-999, increasing through the file.
+    src_id : str
+        Source: spacecraft ID (4 characters) or quasar ID (up to 16).
+    start_time, stop_time : numpy.datetime64
+        Nominal scan start and stop, UTC, 1 s precision.
+    ra, dec : float or None
+        Source right ascension (0-360) and declination (-90 to +90) in
+        degrees, true equator and equinox of date, corrected for aberration.
+        None when the file gives 999 (not provided).
+    tfreq : float
+        Transmitted frequency in Hz for a spacecraft; 0 for a quasar.
+    products : list[ProductEntry]
+        One entry per frequency channel, in file order.
     """
 
     scan_num: int
@@ -85,7 +122,29 @@ class Scan:
 
 @dataclass(repr=False)
 class ObservationFile:
-    """Parsed observation file."""
+    """
+    Parsed RDEF observation file (.obs, CCSDS 506.1-B-1 §4).
+
+    Iterate, index and ``len()`` over its scans; ``print(obs)`` or
+    ``obs.info()`` shows a summary.  Build one with :func:`read_observation`.
+
+    Attributes
+    ----------
+    path : Path
+        File the observation was read from.
+    version : int
+        Format version (``V`` line).  §4.2.4 requires it to match the
+        product files' version; that is not checked here.
+    receive_station : str
+        Receiving station ID, 4 characters (``R`` line).
+    transmit_station : str or None
+        Transmitting station ID (``T`` line); None for one-way data.
+    scans : list[Scan]
+        Scan sections in file order.
+    logs : list[str]
+        Text of the log lines (``F`` lines) after the letter ``F``: how to
+        retrieve receiver messages, data and logs.
+    """
 
     path: Path
     version: int
