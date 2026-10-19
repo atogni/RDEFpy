@@ -39,6 +39,7 @@ from typing import Any, TextIO, overload
 
 import numpy as np
 
+from rdefpy import _utils
 from rdefpy._utils import _Progress, _to_datetime64
 from rdefpy.prd import _display
 
@@ -494,9 +495,19 @@ class RecordData:
         ``i_samples`` / ``q_samples`` invalidates the cache.
         """
         if self._x is None:
-            out = np.empty(self._i.shape[0], dtype=self.complex_dtype)
-            out.real = self._i
-            out.imag = self._q
+            i, q = self._i, self._q
+            out = np.empty(i.shape, dtype=self.complex_dtype)
+            if i.ndim != 1 or i.shape[0] < _utils._THREADED_MIN_SAMPLES:
+                out.real = i
+                out.imag = q
+            else:
+                # Large record: thread chunks (see _utils._in_chunks).
+                # NumPy's casting stores release the GIL.
+                def fill(a, b):
+                    out.real[a:b] = i[a:b]
+                    out.imag[a:b] = q[a:b]
+
+                _utils._in_chunks(i.shape[0], 1, fill)
             out.flags.writeable = False
             self._x = out
         return self._x

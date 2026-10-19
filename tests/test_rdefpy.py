@@ -821,18 +821,46 @@ def test_concatenate_rejects_a_bad_keep():
 # ---------------------------------------------------------------------------
 # Cython fast path agrees with the NumPy reference
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("threaded", [False, True], ids=["1thread", "threads"])
 @pytest.mark.parametrize("bits", [16, 8, 4, 2, 1])
-def test_cython_unpack_matches_numpy(bits):
+def test_cython_unpack_matches_numpy(bits, threaded, monkeypatch):
+    """Whole, or split into thread chunks."""
     from rdefpy.prd import reader
 
     if reader._unpack_fast is None:
         pytest.skip("unpack_cyth extension not built")
-    raw = np.random.default_rng(bits).integers(0, 256, 4096, dtype=np.uint8).tobytes()
+    if threaded:
+        from rdefpy import _utils
+
+        monkeypatch.setattr(_utils, "_THREADED_MIN_SAMPLES", 1)
+    raw = np.random.default_rng(bits).integers(0, 256, 4100, dtype=np.uint8).tobytes()
     i_ref, q_ref = reader._UNPACKERS[bits](raw)
     i_cy, q_cy = reader._unpack_fast(raw, bits)
     assert i_cy.dtype == i_ref.dtype and q_cy.dtype == q_ref.dtype
     np.testing.assert_array_equal(i_cy, i_ref)
     np.testing.assert_array_equal(q_cy, q_ref)
+
+
+@pytest.mark.parametrize("threaded", [False, True], ids=["1thread", "threads"])
+@pytest.mark.parametrize("cdt", [np.complex64, np.complex128])
+@pytest.mark.parametrize("bits", [16, 8, 4, 2, 1])
+def test_samples_are_i_plus_jq_on_every_path(bits, cdt, threaded, monkeypatch):
+    """``samples`` equals ``real = I; imag = Q`` whole or in thread chunks."""
+    from rdefpy import _utils
+
+    if threaded:
+        monkeypatch.setattr(_utils, "_THREADED_MIN_SAMPLES", 1)
+    dt = {16: np.int32, 8: np.int16}.get(bits, np.int8)
+    info = np.iinfo(dt)
+    rng = np.random.default_rng(bits)
+    i, q = (rng.integers(info.min, info.max, 4099, endpoint=True).astype(dt)
+            for _ in range(2))
+    got = RecordData(bits, 4099, i, q, complex_dtype=cdt).samples
+    ref = np.empty(4099, cdt)
+    ref.real = i
+    ref.imag = q
+    assert got.dtype == ref.dtype
+    np.testing.assert_array_equal(got.view(got.real.dtype), ref.view(ref.real.dtype))
 
 
 def test_samples_are_cached_and_read_only():

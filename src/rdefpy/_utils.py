@@ -6,12 +6,14 @@
 
 Time coercion (CCSDS ASCII Time Code B and ISO-8601), the colon-aligned
 row formatter and number formatter used by every ``__str__``, and the
-progress display.
+progress display, and the thread pool that splits large decodes.
 """
 
 from __future__ import annotations
 
+import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -179,3 +181,30 @@ class _Progress:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+# Decodes and complex builds of at least this many samples (8 MB of int8
+# I/Q, 64 MB at complex128) run in _THREADS disjoint chunks: a fresh array
+# that size is bound by first-touch page faults, which threads overlap.
+# Measured on one 100 M-sample record, complex128 build: 490 ms on one
+# thread, 112 ms on 8 (Cython kernel; 158 ms with NumPy stores).
+_THREADED_MIN_SAMPLES = 4_000_000
+_THREADS = min(8, os.cpu_count() or 1)
+_pool = None  # ponytail: one lazy module-level pool, never shut down
+
+
+def _in_chunks(n: int, per: int, fn) -> None:
+    """Call ``fn(a, b)`` over ``[0, n)``: once, or in parallel chunks when large.
+
+    *n* counts input units of *per* samples each; chunk edges fall on whole
+    units.  *fn* must release the GIL to gain anything, and write only its
+    own ``[a, b)``.
+    """
+    global _pool
+    if n * per < _THREADED_MIN_SAMPLES:
+        fn(0, n)
+        return
+    if _pool is None:
+        _pool = ThreadPoolExecutor(_THREADS)
+    edges = np.linspace(0, n, _THREADS + 1).astype(np.int64).tolist()
+    list(_pool.map(fn, edges[:-1], edges[1:]))

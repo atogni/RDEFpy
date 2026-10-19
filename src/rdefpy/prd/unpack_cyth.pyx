@@ -10,11 +10,12 @@ output = 2*k + 1, where k is the two's complement interpretation of the raw bits
 
 Functions
 ---------
-unpack_iq_16_cython   : Unpack 16-bit samples (one 32-bit word per sample)
-unpack_iq_8_cython    : Unpack 8-bit samples (one 16-bit halfword per sample)
-unpack_iq_4_cython    : Unpack 4-bit samples (byte-table gather)
-unpack_iq_2_cython    : Unpack 2-bit samples (byte-table gather)
-unpack_iq_1_cython    : Unpack 1-bit samples (byte-table gather)
+unpack_iq_cython      : Decode one data section (dispatches to the kernels)
+unpack_iq_16_cython   : 16-bit samples (one 32-bit word per sample)
+unpack_iq_8_cython    : 8-bit samples (one 16-bit halfword per sample)
+unpack_iq_4_cython    : 4-bit samples (byte-table gather)
+unpack_iq_2_cython    : 2-bit samples (byte-table gather)
+unpack_iq_1_cython    : 1-bit samples (byte-table gather)
 
 Notes
 -----
@@ -22,7 +23,8 @@ Every unpacker must return arrays identical to its NumPy counterpart in
 ``binary.py`` (the reference); ``tests/test_spec_prd_samples.py`` runs the
 whole spec suite against both.  The sub-byte kernels copy their tables from
 ``binary._BYTE_TABLES``, so the two paths share a single definition of the
-Table 5-2 layout.  All kernels run without the GIL.
+Table 5-2 layout.  All kernels run without the GIL; large records are
+split across threads (``rdefpy._utils._in_chunks``).
 """
 
 import cython
@@ -30,6 +32,7 @@ import numpy as np
 cimport numpy as cnp
 from libc.stdint cimport int8_t, int16_t, int32_t, uint8_t, uint16_t, uint32_t
 
+from rdefpy._utils import _in_chunks
 from rdefpy.prd.binary import _BYTE_TABLES
 
 cnp.import_array()
@@ -74,7 +77,9 @@ _load_tables()
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cpdef tuple unpack_iq_16_cython(const cnp.uint32_t[::1] words):
+cpdef void unpack_iq_16_cython(
+    const cnp.uint32_t[::1] words, int32_t[::1] i_view, int32_t[::1] q_view
+):
     """
     Unpack 16-bit I/Q samples with bias correction (Table 5-2: MSB Q1 I1 LSB).
 
@@ -82,25 +87,17 @@ cpdef tuple unpack_iq_16_cython(const cnp.uint32_t[::1] words):
     ----------
     words : uint32[::1]
         The data section as little-endian 32-bit words, one per sample.
-
-    Returns
-    -------
-    i, q : ndarray (int32)
-        ``2k+1`` values in [-65535, 65535].
+    i_view, q_view : int32[::1]
+        Outputs, one per word: ``2k+1`` values in [-65535, 65535].
     """
     cdef Py_ssize_t n = words.shape[0]
     cdef Py_ssize_t k
     cdef uint32_t w
-    i_arr = np.empty(n, dtype=np.int32)
-    q_arr = np.empty(n, dtype=np.int32)
-    cdef int32_t[::1] i_view = i_arr
-    cdef int32_t[::1] q_view = q_arr
     with nogil:
         for k in range(n):
             w = words[k]
             i_view[k] = 2 * <int32_t><int16_t>(w & 0xFFFF) + 1
             q_view[k] = 2 * <int32_t><int16_t>(w >> 16) + 1
-    return i_arr, q_arr
 
 
 # =============================================================================
@@ -109,7 +106,9 @@ cpdef tuple unpack_iq_16_cython(const cnp.uint32_t[::1] words):
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cpdef tuple unpack_iq_8_cython(const cnp.uint16_t[::1] halves):
+cpdef void unpack_iq_8_cython(
+    const cnp.uint16_t[::1] halves, int16_t[::1] i_view, int16_t[::1] q_view
+):
     """
     Unpack 8-bit I/Q samples with bias correction (Table 5-2: MSB Q2 I2 Q1 I1 LSB).
 
@@ -117,25 +116,17 @@ cpdef tuple unpack_iq_8_cython(const cnp.uint16_t[::1] halves):
     ----------
     halves : uint16[::1]
         The data section as little-endian 16-bit halfwords, one per sample.
-
-    Returns
-    -------
-    i, q : ndarray (int16)
-        ``2k+1`` values in [-255, 255].
+    i_view, q_view : int16[::1]
+        Outputs, one per halfword: ``2k+1`` values in [-255, 255].
     """
     cdef Py_ssize_t n = halves.shape[0]
     cdef Py_ssize_t k
     cdef uint16_t w
-    i_arr = np.empty(n, dtype=np.int16)
-    q_arr = np.empty(n, dtype=np.int16)
-    cdef int16_t[::1] i_view = i_arr
-    cdef int16_t[::1] q_view = q_arr
     with nogil:
         for k in range(n):
             w = halves[k]
             i_view[k] = <int16_t>(2 * <int>(<int8_t>(w & 0xFF)) + 1)
             q_view[k] = <int16_t>(2 * <int>(<int8_t>(w >> 8)) + 1)
-    return i_arr, q_arr
 
 
 # =============================================================================
@@ -144,54 +135,56 @@ cpdef tuple unpack_iq_8_cython(const cnp.uint16_t[::1] halves):
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cpdef tuple unpack_iq_4_cython(const cnp.uint8_t[::1] data):
-    """Unpack 4-bit I/Q samples (one complex sample per byte)."""
+cpdef void unpack_iq_4_cython(
+    const cnp.uint8_t[::1] data, int8_t[::1] i_view, int8_t[::1] q_view
+):
+    """Unpack 4-bit I/Q samples (one complex sample per byte) into i/q_view."""
     cdef Py_ssize_t n = data.shape[0]
     cdef Py_ssize_t k
-    i_arr = np.empty(n, dtype=np.int8)
-    q_arr = np.empty(n, dtype=np.int8)
-    cdef uint8_t* ip = <uint8_t*> cnp.PyArray_DATA(i_arr)
-    cdef uint8_t* qp = <uint8_t*> cnp.PyArray_DATA(q_arr)
+    if n == 0:
+        return
+    cdef uint8_t* ip = <uint8_t*> &i_view[0]
+    cdef uint8_t* qp = <uint8_t*> &q_view[0]
     with nogil:
         for k in range(n):
             ip[k] = _T4I[data[k]]
             qp[k] = _T4Q[data[k]]
-    return i_arr, q_arr
 
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cpdef tuple unpack_iq_2_cython(const cnp.uint8_t[::1] data):
-    """Unpack 2-bit I/Q samples (two complex samples per byte)."""
+cpdef void unpack_iq_2_cython(
+    const cnp.uint8_t[::1] data, int8_t[::1] i_view, int8_t[::1] q_view
+):
+    """Unpack 2-bit I/Q samples (two complex samples per byte) into i/q_view."""
     cdef Py_ssize_t n = data.shape[0]
     cdef Py_ssize_t k
-    i_arr = np.empty(2 * n, dtype=np.int8)
-    q_arr = np.empty(2 * n, dtype=np.int8)
-    cdef uint16_t* ip = <uint16_t*> cnp.PyArray_DATA(i_arr)
-    cdef uint16_t* qp = <uint16_t*> cnp.PyArray_DATA(q_arr)
+    if n == 0:
+        return
+    cdef uint16_t* ip = <uint16_t*> &i_view[0]
+    cdef uint16_t* qp = <uint16_t*> &q_view[0]
     with nogil:
         for k in range(n):
             ip[k] = _T2I[data[k]]
             qp[k] = _T2Q[data[k]]
-    return i_arr, q_arr
 
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cpdef tuple unpack_iq_1_cython(const cnp.uint8_t[::1] data):
-    """Unpack 1-bit I/Q samples (four complex samples per byte)."""
+cpdef void unpack_iq_1_cython(
+    const cnp.uint8_t[::1] data, int8_t[::1] i_view, int8_t[::1] q_view
+):
+    """Unpack 1-bit I/Q samples (four complex samples per byte) into i/q_view."""
     cdef Py_ssize_t n = data.shape[0]
     cdef Py_ssize_t k
-    i_arr = np.empty(4 * n, dtype=np.int8)
-    q_arr = np.empty(4 * n, dtype=np.int8)
-    cdef uint32_t* ip = <uint32_t*> cnp.PyArray_DATA(i_arr)
-    cdef uint32_t* qp = <uint32_t*> cnp.PyArray_DATA(q_arr)
+    if n == 0:
+        return
+    cdef uint32_t* ip = <uint32_t*> &i_view[0]
+    cdef uint32_t* qp = <uint32_t*> &q_view[0]
     with nogil:
         for k in range(n):
             ip[k] = _T1I[data[k]]
             qp[k] = _T1Q[data[k]]
-    return i_arr, q_arr
-
 
 
 # =============================================================================
@@ -204,6 +197,8 @@ _VALID_SAMPLE_SIZES = frozenset([1, 2, 4, 8, 16])
 # as in the NumPy reference.
 _UNIT = {16: 4, 8: 2, 4: 1, 2: 1, 1: 1}
 _INPUT_DTYPE = {16: "<u4", 8: "<u2", 4: np.uint8, 2: np.uint8, 1: np.uint8}
+# Output dtype and complex samples per input element.
+_OUTPUT = {16: (np.int32, 1), 8: (np.int16, 1), 4: (np.int8, 1), 2: (np.int8, 2), 1: (np.int8, 4)}
 _KERNEL = {
     16: unpack_iq_16_cython,
     8: unpack_iq_8_cython,
@@ -236,8 +231,14 @@ def unpack_iq_cython(data, int sample_size) -> tuple:
     """
     if sample_size not in _VALID_SAMPLE_SIZES:
         raise ValueError(f"Unsupported sample_size: {sample_size}")
-    unit = _UNIT[sample_size]
-    count = len(data) // unit
-    return _KERNEL[sample_size](
-        np.frombuffer(data, dtype=_INPUT_DTYPE[sample_size], count=count)
-    )
+    count = len(data) // _UNIT[sample_size]
+    src = np.frombuffer(data, dtype=_INPUT_DTYPE[sample_size], count=count)
+    dtype, per = _OUTPUT[sample_size]
+    i_arr = np.empty(count * per, dtype=dtype)
+    q_arr = np.empty(count * per, dtype=dtype)
+    kernel = _KERNEL[sample_size]
+    # Chunks fall on whole input elements; large records use threads.
+    _in_chunks(count, per, lambda a, b: kernel(
+        src[a:b], i_arr[a * per : b * per], q_arr[a * per : b * per]
+    ))
+    return i_arr, q_arr
