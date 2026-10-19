@@ -49,7 +49,6 @@ from rdefpy.prd.classes import (
     RecordData,
     RecordHeader,
     _downconv_hz,
-    _load_records,
 )
 
 # =============================================================================
@@ -209,7 +208,13 @@ class _DiskSource:
         f: BinaryIO | None = None,
     ) -> RecordData:
         """Read and decode the samples (§5.3), through *f* if given."""
-        i, q = _decode_iq(self.read_bytes(f), header.sample_size)
+        return self.decode(self.read_bytes(f), header, writeable=writeable)
+
+    def decode(
+        self, data_bytes: bytes, header: RecordHeader, *, writeable: bool
+    ) -> RecordData:
+        """Decode this record's data section, already read, into samples."""
+        i, q = _decode_iq(data_bytes, header.sample_size)
         if not writeable:
             # Transient read: an in-place edit would change a copy nobody
             # keeps, so make it an error instead of a silent no-op.
@@ -392,8 +397,8 @@ def read_product(
         the records *examined* (including skipped ones), not the number
         returned.
     progress : bool
-        Draw progress bars on stderr (default False): one for the header
-        pass, and one for loading when records are at or below 1 kHz.
+        Draw a progress bar on stderr (default False) for the header pass,
+        which also loads the records at or below 1 kHz.
     start_epoch, stop_epoch : datetime, np.datetime64, str, or None, optional
         Keep records with ``start_epoch <= timetag < stop_epoch``
         (half-open, so consecutive windows tile without overlap or gap),
@@ -500,11 +505,6 @@ def read_product(
         )
     )
 
-    _load_records(
-        [r for r in pf.records if r.header.sample_rate <= _AUTO_LOAD_MAX_RATE_HZ],
-        progress=progress,
-    )
-
     pf._check_constant_fields()
 
     return pf
@@ -555,7 +555,18 @@ def _walk_records(
             _validate_record_length(hdr.record_length, idx)
             data_size = hdr.record_length - _HEADER_SIZE
             offset = f.tell()
-            _skip(f, data_size, file_size, idx, hdr.record_length)
+            # Samples read_product loads anyway are read now, in this pass:
+            # one sequential read instead of a second seek-and-read per record.
+            if hdr.sample_rate <= _AUTO_LOAD_MAX_RATE_HZ:
+                data_bytes = f.read(data_size)
+                if len(data_bytes) != data_size:
+                    raise EOFError(
+                        f"Truncated product file: record {idx} declares "
+                        f"{hdr.record_length} bytes but the file ends early (§5.1)."
+                    )
+            else:
+                data_bytes = None
+                _skip(f, data_size, file_size, idx, hdr.record_length)
             pbar.update(1 if use_record_limit else hdr.record_length)
             idx += 1
 
@@ -586,6 +597,8 @@ def _walk_records(
                 ):
                     continue
 
-            yield Record._on_disk(
-                hdr, _DiskSource(path, offset, data_size, complex_dtype, stamp)
-            )
+            src = _DiskSource(path, offset, data_size, complex_dtype, stamp)
+            rec = Record._on_disk(hdr, src)
+            if data_bytes is not None:
+                rec._data = src.decode(data_bytes, hdr, writeable=True)
+            yield rec
