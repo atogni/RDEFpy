@@ -185,14 +185,8 @@ class _DiskSource:
             )
         return self.path.open("rb")
 
-    def read(
-        self,
-        header: RecordHeader,
-        *,
-        writeable: bool,
-        f: BinaryIO | None = None,
-    ) -> RecordData:
-        """Read and decode the samples (§5.3), through *f* if given."""
+    def read_bytes(self, f: BinaryIO | None = None) -> bytes:
+        """The data section exactly as on disk, through *f* if given."""
         if f is None:
             with self.open() as fh:
                 fh.seek(self.offset)
@@ -205,7 +199,17 @@ class _DiskSource:
                 f"Truncated data section: expected {self.size} bytes, "
                 f"got {len(data_bytes)} (§5.1)"
             )
-        i, q = _decode_iq(data_bytes, header.sample_size)
+        return data_bytes
+
+    def read(
+        self,
+        header: RecordHeader,
+        *,
+        writeable: bool,
+        f: BinaryIO | None = None,
+    ) -> RecordData:
+        """Read and decode the samples (§5.3), through *f* if given."""
+        i, q = _decode_iq(self.read_bytes(f), header.sample_size)
         if not writeable:
             # Transient read: an in-place edit would change a copy nobody
             # keeps, so make it an error instead of a silent no-op.

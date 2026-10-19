@@ -621,7 +621,9 @@ def pack_record_data(rec: Record) -> bytes:
 # =============================================================================
 
 
-def _write_record_to_file(file_obj: BinaryIO, rec: Record) -> None:
+def _write_record_to_file(
+    file_obj: BinaryIO, rec: Record, handles: dict | None = None
+) -> None:
     """
     Write complete record (header + data) to open binary file.
 
@@ -631,6 +633,8 @@ def _write_record_to_file(file_obj: BinaryIO, rec: Record) -> None:
         Open binary file object (mode 'wb' or 'ab')
     rec : Record
         Record with header and data to write
+    handles : dict, optional
+        Open source files by path, reused across calls; the caller closes them.
 
     Raises
     ------
@@ -649,10 +653,27 @@ def _write_record_to_file(file_obj: BinaryIO, rec: Record) -> None:
     ...     for rec in product_file.records:
     ...         _write_record_to_file(f, rec)
     """
-    # Hold the samples for the whole write: on an unloaded record this is
-    # the one disk read, and pack_record_data's access reuses it.
-    data = rec.data
-    if data is None or len(data) == 0:
+    # An unloaded record whose samples nobody holds is copied from its file
+    # verbatim: decoding and re-packing whole samples is the identity (the
+    # 2k+1 map and the bit packing are one-to-one), so the bytes are the
+    # same, without the decode, the I/Q arrays and the packing.
+    src = rec._source
+    hdr = rec.header
+    verbatim = (
+        rec._data is None
+        and src is not None
+        and (rec._weak is None or rec._weak() is None)
+        and hdr.sample_size in _VALID_SAMPLE_SIZES
+        and src.size * 8 % (2 * hdr.sample_size) == 0
+    )
+    if verbatim:
+        n_complex = len(rec)
+    else:
+        # Hold the samples for the whole write: on an unloaded record this
+        # is the one disk read, and pack_record_data's access reuses it.
+        data = rec.data
+        n_complex = 0 if data is None else len(data)
+    if n_complex == 0:
         raise ValueError(
             "Record contains no I/Q data. "
             "Use a reader that loads samples (not read_headers), "
@@ -660,8 +681,19 @@ def _write_record_to_file(file_obj: BinaryIO, rec: Record) -> None:
         )
 
     # Pack header and data
-    header_bytes = pack_record_header(rec.header)
-    data_bytes = pack_record_data(rec)
+    header_bytes = pack_record_header(hdr)
+    if verbatim:
+        if n_complex != int(hdr.sample_rate):
+            raise ValueError(
+                f"Record data length ({n_complex}) does not match "
+                f"header.sample_rate ({int(hdr.sample_rate)})"
+            )
+        f = None if handles is None else handles.get(src.path)
+        if f is None and handles is not None:
+            f = handles[src.path] = src.open()
+        data_bytes = src.read_bytes(f)
+    else:
+        data_bytes = pack_record_data(rec)
 
     # Verify record_length consistency
     expected_length = _HEADER_SIZE_BYTES + len(data_bytes)
@@ -759,14 +791,20 @@ def write_product(
     fd, tmp = tempfile.mkstemp(
         dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".tmp"
     )
+    handles: dict = {}  # source files of verbatim-copied records
     try:
         with (
             os.fdopen(fd, "wb") as fp,
             _Progress(len(product.records), progress) as pbar,
         ):
-            for rec in product.records:
-                _write_record_to_file(fp, rec)
-                pbar.update(1)
+            try:
+                for rec in product.records:
+                    _write_record_to_file(fp, rec, handles)
+                    pbar.update(1)
+            finally:
+                # Closed before the replace: Windows cannot replace an open file.
+                for f in handles.values():
+                    f.close()
             fp.flush()
             os.fsync(fp.fileno())
         # mkstemp creates the file owner-only (0600); give it the target's

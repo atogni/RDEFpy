@@ -238,6 +238,22 @@ def test_written_bytes_match_the_original_file(name, loaded, tmp_path):
     assert out.read_bytes() == (DATA / name).read_bytes()
 
 
+def test_verbatim_write_keeps_header_edits_and_checks(tmp_path, decodes):
+    """Unloaded records are copied without decoding; header edits still apply."""
+    pf = read_product(PRD_16)
+    pf.correct_header(validity_flag=1)
+    out = tmp_path / "v.prd"
+    write_product(out, pf)
+    assert decodes == []
+    back = read_product(out)
+    assert all(r.header.validity_flag == 1 for r in back)
+    assert iq_digest(back) == iq_digest(read_product(PRD_16))
+
+    pf[0].header.sample_rate = 1000  # samples no longer match the header
+    with pytest.raises(ValueError, match="does not match"):
+        write_product(tmp_path / "bad.prd", pf)
+
+
 def test_write_over_its_own_on_disk_source(tmp_path):
     """Records still read from the target while it is replaced (temp + os.replace)."""
     path = tmp_path / PRD_16.name
