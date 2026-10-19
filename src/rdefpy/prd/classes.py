@@ -70,6 +70,7 @@ _HEADER_FIELDS = (
     "empty_fields_future_extension",
     "empty_fields_internal_agency_use",
 )
+_HEADER_FIELD_SET = frozenset(_HEADER_FIELDS)
 
 _HEADER_SIZE_BYTES = 176
 
@@ -277,13 +278,15 @@ class RecordHeader:
         Headers are mutable: fields can be modified by direct assignment or
         via ``Record.correct_header()``.
         """
+        if info is None:
+            info = {}
+        elif not _HEADER_FIELD_SET.issuperset(info):
+            key = next(k for k in info if k not in _HEADER_FIELD_SET)
+            raise KeyError(f"Unknown header field: {key}")
+        # One pass over the slots: the reader builds one header per record.
+        get = info.get
         for field in _HEADER_FIELDS:
-            setattr(self, field, None)
-        if info is not None:
-            for key, value in info.items():
-                if key not in _HEADER_FIELDS:
-                    raise KeyError(f"Unknown header field: {key}")
-                setattr(self, key, value)
+            setattr(self, field, get(field))
 
     def __deepcopy__(self, memo: dict) -> RecordHeader:
         """Deep-copy every header field into a new ``RecordHeader``."""
