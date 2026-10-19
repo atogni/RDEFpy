@@ -841,13 +841,25 @@ def test_cython_unpack_matches_numpy(bits, threaded, monkeypatch):
     np.testing.assert_array_equal(q_cy, q_ref)
 
 
+@pytest.mark.parametrize("kernel", [True, False], ids=["cython", "numpy"])
 @pytest.mark.parametrize("threaded", [False, True], ids=["1thread", "threads"])
 @pytest.mark.parametrize("cdt", [np.complex64, np.complex128])
 @pytest.mark.parametrize("bits", [16, 8, 4, 2, 1])
-def test_samples_are_i_plus_jq_on_every_path(bits, cdt, threaded, monkeypatch):
-    """``samples`` equals ``real = I; imag = Q`` whole or in thread chunks."""
+def test_samples_are_i_plus_jq_on_every_path(bits, cdt, threaded, kernel, monkeypatch):
+    """``samples`` equals ``real = I; imag = Q`` whole or in thread chunks,
+    with or without the Cython interleave."""
     from rdefpy import _utils
+    from rdefpy.prd import classes, reader
 
+    if kernel:
+        if reader._unpack_fast is None:
+            pytest.skip("unpack_cyth extension not built")
+        from conftest import _require_fresh_build
+
+        _require_fresh_build()
+        assert classes._iq_to_complex is not None  # built, so it must be there
+    else:
+        monkeypatch.setattr(classes, "_iq_to_complex", None)
     if threaded:
         monkeypatch.setattr(_utils, "_THREADED_MIN_SAMPLES", 1)
     dt = {16: np.int32, 8: np.int16}.get(bits, np.int8)

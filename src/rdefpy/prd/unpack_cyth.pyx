@@ -16,6 +16,7 @@ unpack_iq_8_cython    : 8-bit samples (one 16-bit halfword per sample)
 unpack_iq_4_cython    : 4-bit samples (byte-table gather)
 unpack_iq_2_cython    : 2-bit samples (byte-table gather)
 unpack_iq_1_cython    : 1-bit samples (byte-table gather)
+iq_to_complex         : I + jQ in one interleaving pass
 
 Notes
 -----
@@ -185,6 +186,42 @@ cpdef void unpack_iq_1_cython(
         for k in range(n):
             ip[k] = _T1I[data[k]]
             qp[k] = _T1Q[data[k]]
+
+
+# =============================================================================
+# I/Q -> complex: one interleaving pass
+# =============================================================================
+
+ctypedef fused iq_t:
+    int8_t
+    int16_t
+    int32_t
+
+ctypedef fused re_t:
+    float
+    double
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def iq_to_complex(const iq_t[::1] i, const iq_t[::1] q, re_t[::1] out):
+    """
+    Fill *out*, a complex array viewed as its float parts, with ``I + jQ``.
+
+    Writes ``out[2k] = i[k]`` and ``out[2k+1] = q[k]`` in one sequential
+    pass: the same values ``x.real = i; x.imag = q`` stores (integers are
+    exact in float32 and float64), with each cache line written once.
+    Used on thread chunks of large records, where it beats NumPy's two
+    strided stores; on one thread page faults dominate and it does not.
+    """
+    cdef Py_ssize_t n = i.shape[0]
+    cdef Py_ssize_t k
+    if q.shape[0] != n or out.shape[0] != 2 * n:
+        raise ValueError("iq_to_complex: length mismatch")
+    with nogil:
+        for k in range(n):
+            out[2 * k] = <re_t>i[k]
+            out[2 * k + 1] = <re_t>q[k]
 
 
 # =============================================================================

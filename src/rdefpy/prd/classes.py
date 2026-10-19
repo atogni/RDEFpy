@@ -43,6 +43,13 @@ from rdefpy import _utils
 from rdefpy._utils import _Progress, _to_datetime64
 from rdefpy.prd import _display
 
+# Cython I/Q -> complex interleave (unpack_cyth.pyx) for thread chunks of
+# large records; NumPy when not built.
+try:
+    from rdefpy.prd.unpack_cyth import iq_to_complex as _iq_to_complex
+except ImportError:
+    _iq_to_complex = None
+
 # =============================================================================
 # Constants
 # =============================================================================
@@ -501,11 +508,22 @@ class RecordData:
                 out.real = i
                 out.imag = q
             else:
-                # Large record: thread chunks (see _utils._in_chunks).
-                # NumPy's casting stores release the GIL.
+                # Large record: thread chunks (see _utils._in_chunks), each
+                # in one interleaving pass when the Cython kernel is built.
+                # Same values either way.
+                parts = out.view(out.real.dtype)
+                kernel = (
+                    _iq_to_complex
+                    if i.flags.c_contiguous and q.flags.c_contiguous
+                    else None
+                )
+
                 def fill(a, b):
-                    out.real[a:b] = i[a:b]
-                    out.imag[a:b] = q[a:b]
+                    if kernel is not None:
+                        kernel(i[a:b], q[a:b], parts[2 * a : 2 * b])
+                    else:
+                        out.real[a:b] = i[a:b]
+                        out.imag[a:b] = q[a:b]
 
                 _utils._in_chunks(i.shape[0], 1, fill)
             out.flags.writeable = False

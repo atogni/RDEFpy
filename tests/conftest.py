@@ -34,7 +34,7 @@ def _require_fresh_build() -> None:
 @pytest.fixture(params=["cython", "numpy"])
 def decode_path(request, monkeypatch):
     """Force the reader onto one I/Q decoder for the duration of a test."""
-    from rdefpy.prd import reader
+    from rdefpy.prd import classes, reader
 
     if request.param == "cython":
         if reader._unpack_fast is None:
@@ -42,6 +42,7 @@ def decode_path(request, monkeypatch):
         _require_fresh_build()
     else:
         monkeypatch.setattr(reader, "_unpack_fast", None)
+        monkeypatch.setattr(classes, "_iq_to_complex", None)
     return request.param
 
 
