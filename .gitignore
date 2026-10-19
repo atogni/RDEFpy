@@ -10,3 +10,6 @@ dist/
 .pytest_cache/
 internal-testing/
 .vscode/
+
+# Local notes
+TODO.md

@@ -2,19 +2,58 @@
 # Author: Andrea Togni
 # SPDX-License-Identifier: MIT
 
-"""CCSDS Delta-DOR Raw Data Exchange Format (RDEF) reader.
+"""CCSDS Delta-DOR Raw Data Exchange Format (RDEF) product-file reader and writer.
 
-Reads the ASCII observation files (.obs) of CCSDS 506.1-B-1 (June 2013), §4.
+Implements the product files (.prd) of CCSDS 506.1-B-1 (June 2013), §5:
+binary one-second records of complex I/Q with full downconversion
+metadata, and reads the ASCII observation files (§4) that index them.
 
-    from rdefpy import read_observation
+    from rdefpy import read_product
 
-    obs = read_observation("session.obs")
-    print(obs)
+    pf = read_product("scan.prd")
+    pf.info()
 
-Product-file (.prd, §5) support is not yet published.
+Product files run to gigabytes. ``read_product`` loads records at or below
+1 kHz (small, the common case) and leaves faster ones on disk: their samples
+are read when accessed and freed when no longer used, so a loop holds one
+record at a time; ``load()`` keeps them, ``release()`` drops them:
+
+    pf = read_product("scan.prd")
+    for rec in pf:
+        print(rec.header.timetag, rec.data.power_db)
+    pf.load()                                          # keep all in memory
+
+Scope
+-----
+This is a format layer: it decodes bytes into samples with correct time
+tags, and encodes them back. It does not estimate. Spectra, carrier
+tracking and simulation belong to the caller; this package hands them
+correct samples with correct time tags, and depends on NumPy alone.
+
+Successor to the original rdefpy. That library additionally
+carried a ``ComplexSignal`` DSP class, an SPI carrier estimator with a
+Pc/N0 companion, matplotlib record browsers and spectrograms, and pandas
+export. Those were left out on purpose: estimators are not a format's
+job, and matplotlib and pandas do not belong in a byte parser.
+
+Low-level decoding is a verbatim port and is meant to stay that way --
+the ``2k+1`` transform (§5.3.6), the bit offsets, and the header struct
+ARE the format. ``tests/test_rdefpy.py`` pins all five sample sizes.
 """
 
 from rdefpy.obs import ObservationFile, ProductEntry, Scan, read_observation
+from rdefpy.prd import (
+    ProductFile,
+    Record,
+    RecordData,
+    RecordHeader,
+    pack_record_data,
+    pack_record_header,
+    read_headers,
+    read_product,
+    scan_product,
+    write_product,
+)
 
 __all__ = [
     # Observation files (.obs, §4)
@@ -22,4 +61,15 @@ __all__ = [
     "ProductEntry",
     "Scan",
     "read_observation",
+    # Product files (.prd, §5)
+    "ProductFile",
+    "Record",
+    "RecordData",
+    "RecordHeader",
+    "pack_record_data",
+    "pack_record_header",
+    "read_headers",
+    "read_product",
+    "scan_product",
+    "write_product",
 ]
