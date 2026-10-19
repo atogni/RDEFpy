@@ -206,14 +206,18 @@ def test_empty_data_returns_empty_arrays_of_the_right_dtype():
 # =============================================================================
 
 
+@pytest.mark.parametrize("loaded", [True, False], ids=["packed", "verbatim"])
 @pytest.mark.parametrize("name", FIXTURES)
-def test_write_then_read_is_lossless(name, tmp_path):
+def test_write_then_read_is_lossless(name, loaded, tmp_path):
     """``pack_record_data`` is the exact inverse of ``unpack_iq_N``.
 
     The §5.3.6 bias inversion and the bit packing have to round-trip for
-    every sample size, or a corrected file silently loses samples.
+    every sample size, or a corrected file silently loses samples.  Loaded
+    records go through the packer; unloaded ones are copied verbatim.
     """
     pf = read_product(DATA / name)
+    if loaded:
+        pf.load()
     out = tmp_path / name
     write_product(out, pf)
 
@@ -222,12 +226,16 @@ def test_write_then_read_is_lossless(name, tmp_path):
     assert out.stat().st_size == (DATA / name).stat().st_size
 
 
-def test_written_bytes_match_the_original_file(tmp_path):
+@pytest.mark.parametrize("loaded", [True, False], ids=["packed", "verbatim"])
+@pytest.mark.parametrize("name", FIXTURES)
+def test_written_bytes_match_the_original_file(name, loaded, tmp_path):
     """A read/write cycle reproduces the file byte for byte, header included."""
-    pf = read_product(PRD_16)
+    pf = read_product(DATA / name)
+    if loaded:
+        pf.load()
     out = tmp_path / "rt.prd"
     write_product(out, pf)
-    assert out.read_bytes() == PRD_16.read_bytes()
+    assert out.read_bytes() == (DATA / name).read_bytes()
 
 
 def test_write_over_its_own_on_disk_source(tmp_path):

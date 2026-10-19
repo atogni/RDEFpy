@@ -245,25 +245,20 @@ def _invert_bias(
     Returns
     -------
     k : np.ndarray
-        Original values, clipped and with appropriate dtype
+        Original values, clipped
 
     Notes
     -----
-    For 16-bit samples: outputs int16 (little-endian)
-    For 8-bit samples: outputs int8 (little-endian)
-    For others: outputs int16 for further processing
+    Computed in the dtype of *y*, which holds every value involved.  The
+    result is k, still in that dtype; the caller narrows it on store.
     """
-    y64 = y.astype(np.int64)
-    k = (y64 - 1) // 2
-    k = np.clip(k, min_val, max_val)
-
-    if sample_size == 16:
-        return k.astype("<i2")
-    elif sample_size == 8:
-        return k.astype("<i1")
-    else:
-        # For 4-bit, 2-bit, and 1-bit: keep int16 for further encoding
-        return k.astype(np.int16)
+    # Clipping y to [2*min+1, 2*max+1] first gives the same k as clipping
+    # floor((y-1)/2) to [min, max] (both maps are monotone), and keeps y-1
+    # from overflowing.  >> 1 on a signed integer is floor division by 2.
+    k = np.clip(y, 2 * min_val + 1, 2 * max_val + 1)
+    k -= 1
+    k >>= 1
+    return k
 
 
 # =============================================================================
@@ -539,16 +534,15 @@ def pack_record_data(rec: Record) -> bytes:
         i_k = _invert_bias(i_vals, 4, -8, 7)
         q_k = _invert_bias(q_vals, 4, -8, 7)
 
-        # Convert signed [-8, 7] to 4-bit unsigned (two's complement)
-        i_nib = np.where(i_k < 0, i_k + 16, i_k).astype(np.uint8)  # 0..15
-        q_nib = np.where(q_k < 0, q_k + 16, q_k).astype(np.uint8)  # 0..15
-
         # Pack nibbles into bytes with contiguous packing per §5.3:
         # Byte layout: [Q3 Q2 Q1 Q0] [I3 I2 I1 I0] (MSB -> LSB)
-        # I in low nibble bits [0:3], Q in high nibble bits [4:7]
-        b = (i_nib | (q_nib << 4)).astype(np.uint8)
+        # I in low nibble bits [0:3], Q in high nibble bits [4:7].  The low
+        # 4 bits of int8 k are its 4-bit two's-complement code.
+        i_k &= 0xF
+        q_k <<= 4
+        q_k |= i_k
 
-        return b.tobytes()
+        return q_k.tobytes()
 
     # =========================================================================
     # 2-bit Sample Packing (Word-Packed)
@@ -566,12 +560,16 @@ def pack_record_data(rec: Record) -> bytes:
         i_k = _invert_bias(i_vals, 2, -2, 1)
         q_k = _invert_bias(q_vals, 2, -2, 1)
 
-        # Convert signed [-2, 1] to 2-bit unsigned (two's complement)
-        # 0 → 00, 1 → 01, -2 → 10, -1 → 11
-        i_code = np.where(i_k < 0, i_k + 4, i_k).astype(np.uint8) & 0x3
-        q_code = np.where(q_k < 0, q_k + 4, q_k).astype(np.uint8) & 0x3
+        # The low 2 bits of int8 k are its 2-bit two's-complement code:
+        # 0 → 00, 1 → 01, -2 → 10, -1 → 11.  One nibble per pair, Q above I.
+        n_words = (n_complex + 3) // 4  # Ceiling division
+        nib = np.zeros(4 * n_words, dtype=np.int8)  # zero-padded to whole words
+        np.bitwise_and(i_k, 0x3, out=nib[:n_complex])
+        q_k <<= 2
+        q_k &= 0xC
+        nib[:n_complex] |= q_k
 
-        # Pack into 16-bit words: 4 I/Q pairs per word
+        # Pack into 16-bit words: 4 I/Q pairs per word, two per byte
         # Word layout:
         #   bits  1–0 : I0
         #   bits  3–2 : Q0
@@ -581,21 +579,11 @@ def pack_record_data(rec: Record) -> bytes:
         #   bits 11–10: Q2
         #   bits 13–12: I3
         #   bits 15–14: Q3
-        n_words = (n_complex + 3) // 4  # Ceiling division
-        out = np.zeros(n_words, dtype=np.uint16)
+        # i.e. little-endian bytes holding pairs (0, 1), (2, 3).
+        out = nib[1::2] << 4
+        out |= nib[0::2]
 
-        for s_idx in range(4):
-            pair_idx = np.arange(n_words) * 4 + s_idx
-            mask = pair_idx < n_complex
-
-            if not np.any(mask):
-                break
-
-            valid_idx = pair_idx[mask]
-            out[mask] |= (i_code[valid_idx].astype(np.uint16) & 0x3) << (4 * s_idx)
-            out[mask] |= (q_code[valid_idx].astype(np.uint16) & 0x3) << (4 * s_idx + 2)
-
-        return out.astype("<u2").tobytes()
+        return out.tobytes()
 
     # =========================================================================
     # 1-bit Sample Packing (BPSK)
