@@ -18,7 +18,9 @@ import copy
 import gc
 import hashlib
 import io
+import os
 import pickle
+import time
 import warnings
 from pathlib import Path
 
@@ -873,6 +875,33 @@ def test_samples_are_i_plus_jq_on_every_path(bits, cdt, threaded, kernel, monkey
     ref.imag = q
     assert got.dtype == ref.dtype
     np.testing.assert_array_equal(got.view(got.real.dtype), ref.view(ref.real.dtype))
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_threaded_decode_works_in_a_forked_child(monkeypatch):
+    """The thread pool does not survive fork(); the child must start its own."""
+    from rdefpy import _utils
+    from rdefpy.prd import reader
+
+    monkeypatch.setattr(_utils, "_THREADED_MIN_SAMPLES", 1)
+    raw = bytes(range(256)) * 16
+    reader._decode_iq(raw, 2)  # the parent's pool now exists
+    pid = os.fork()
+    if pid == 0:  # child: decode once more, then leave without pytest teardown
+        try:
+            reader._decode_iq(raw, 2)
+            os._exit(0)
+        finally:
+            os._exit(1)
+    for _ in range(200):  # a hung child would wait forever on its pool
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("forked child hung on the inherited thread pool")
+    assert os.waitstatus_to_exitcode(status) == 0
 
 
 def test_samples_are_cached_and_read_only():

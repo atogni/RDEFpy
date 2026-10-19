@@ -193,6 +193,17 @@ _THREADS = min(8, os.cpu_count() or 1)
 _pool = None  # ponytail: one lazy module-level pool, never shut down
 
 
+def _drop_pool() -> None:
+    # A forked child inherits _pool but none of its threads: it would queue
+    # chunks that nothing runs.  Start a fresh pool there instead.
+    global _pool
+    _pool = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_drop_pool)
+
+
 def _in_chunks(n: int, per: int, fn) -> None:
     """Call ``fn(a, b)`` over ``[0, n)``: once, or in parallel chunks when large.
 
