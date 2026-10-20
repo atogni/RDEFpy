@@ -74,7 +74,7 @@ from typing import BinaryIO
 import numpy as np
 
 from rdefpy._utils import _Progress
-from rdefpy.prd.binary import (
+from rdefpy.prd._binary import (
     _FLOAT_FIELDS,
     _RDEF_HEADER_STRUCT,
     _VALID_SAMPLE_SIZES,

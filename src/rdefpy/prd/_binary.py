@@ -23,10 +23,10 @@ I/Q Data Unpacking
 
 Notes
 -----
-All I/Q unpacking functions apply the ``2k+1`` bias correction defined
-in §5.3.6 (truncation encoding).  Header layout follows Table 5-1 /
-Figure 5-3.  I/Q packing per sample size follows §5.3 and Table 5-2.
-Byte order is little-endian throughout (§1.3.3, §5.1.5).
+All I/Q unpacking functions apply the ``2k+1`` transform of §5.3.6,
+which compensates the offset of the §5.3.5 truncation.  Header layout
+follows Table 5-1 / Figure 5-3.  I/Q packing per sample size follows §5.3
+and Table 5-2.  Byte order is little-endian throughout (§5.1.5).
 
 The ``2k+1`` transform, the sign extension and the bit offsets ARE the
 format: a plausible-looking simplification changes recorded sample values.
@@ -35,24 +35,20 @@ Any edit here must keep two test files green:
 - ``tests/test_spec_prd_samples.py`` checks every decoder against an
   independent transcription of Table 5-2 (``tests/rdef_spec.py``),
   including hand-worked words, one-slot sweeps and all 256 byte values.
-- ``tests/test_rdefpy.py`` pins decoded I/Q to digests from the original
-  rdefpy.
+- ``tests/test_rdefpy.py`` pins the decoded I/Q of the test files to fixed
+  SHA-256 digests.
 
 These NumPy paths are the reference and the fallback.  The Cython port
 (``unpack_cyth.pyx``, built by ``setup.py``) is what ``reader._decode_iq``
 uses when the extension is present; it must return identical arrays, and
-it takes its 4/2/1-bit tables from :func:`_byte_tables` here.
-
-Speed for one 20 Msps record (Python 3.11, one thread), NumPy / Cython:
-16-bit 98 / 54 ms, 8-bit 59 / 31, 4-bit 113 / 20, 2-bit 73 / 16,
-1-bit 35 / 12.  Much of that is first-touch page faults on the freshly
-allocated outputs, not arithmetic.
+it copies its 4/2/1-bit tables from ``_BYTE_TABLES`` here.
 """
 
 from __future__ import annotations
 
 import math
 import struct
+import sys
 import warnings
 from typing import BinaryIO
 
@@ -62,12 +58,33 @@ import numpy as np
 # Constants and Structure Definitions
 # =============================================================================
 
-# Struct definitions per CCSDS 506.1-B-1 (Table 5-1 / Figure 5-3)
-# Field order: label | length | version | station | spacecraft | sample_size |
-#   sample_rate | validity | agency | rf_to_if | if_to_chan | year | doy | sod |
-#   picoseconds | accum_phase | c0 | c1 | c2 | c3 | reserved(36) | reserved(40) | end
+# Header struct per CCSDS 506.1-B-1 (Table 5-1 / Figure 5-3).
 _RDEF_HEADER_STRUCT = struct.Struct(
     "<4s I H H H H I H H d d H H I d d d d d d 36s 40s i"
+)
+# Names of the fields between RECORD LABEL and END LABEL, in file order.
+_FIELDS = (
+    "record_length",
+    "record_version_id",
+    "station_id",
+    "spacecraft_id",
+    "sample_size",
+    "sample_rate",
+    "validity_flag",
+    "agency_flag",
+    "rf_to_if_downconv",
+    "if_to_channel_downconv",
+    "time_tag_year",
+    "time_tag_doy",
+    "time_tag_second_of_day",
+    "time_tag_picoseconds_of_the_second",
+    "channel_accumulated_phase",
+    "channel_phase_polynomial_coefficient_0",
+    "channel_phase_polynomial_coefficient_1",
+    "channel_phase_polynomial_coefficient_2",
+    "channel_phase_polynomial_coefficient_3",
+    "empty_fields_future_extension",
+    "empty_fields_internal_agency_use",
 )
 _RDEF_HEADER_PREFIX_STRUCT = struct.Struct("<4s I")
 # Derived sizes
@@ -100,7 +117,7 @@ def _byte_tables(bits: int) -> tuple[np.ndarray, np.ndarray]:
 
     - sample *s* of the byte has I at bit ``2*bits*s`` and Q at
       ``2*bits*s + bits`` (Table 5-2; time runs LSB to MSB, §5.3.4);
-    - a *bits*-wide field is the two's-complement code *k*, stored as
+    - a *bits*-wide field is the two's-complement code *k*, decoded as
       ``2k+1`` (§5.3.6).
 
     Each row of *n* int8 values is viewed as one ``n``-byte integer, so a
@@ -138,8 +155,20 @@ def _validate_label(label: bytes, record_index: int) -> None:
     """Validate RDEF record header label."""
     if label != b"RDEF":
         raise ValueError(
-            f"Not an RDEF record header (label={label!r}) | Record {record_index}"
+            f"Record {record_index}: RECORD LABEL {label!r}, "
+            "expected b'RDEF' (Table 5-1)"
         )
+
+
+def _user_stacklevel() -> int:
+    """``stacklevel`` that points a warning at the first frame outside rdefpy."""
+    frame, level = sys._getframe(1), 1
+    while frame is not None:
+        module = frame.f_globals.get("__name__") or ""
+        if module.partition(".")[0] != "rdefpy":
+            break
+        frame, level = frame.f_back, level + 1
+    return level
 
 
 def _out_of_range(h: dict) -> list[str]:
@@ -172,7 +201,8 @@ def _out_of_range(h: dict) -> list[str]:
     for f in _FLOAT_FIELDS:
         v = h[f]
         if not math.isfinite(v) or (v == 0 and math.copysign(1.0, v) < 0):
-            bad.append(f"  - {f}: {v!r} (§5.2.4: NaN, -Inf, +Inf and -0 not supported)")
+            bad.append(f"  - {f}: {v!r} "
+                       "(§5.2.4: NaN, -Inf, +Inf and -0 not supported)")
     return bad
 
 
@@ -190,8 +220,8 @@ def _validate_header(
     ``ValueError``: without them the record cannot be parsed, nor the next
     one found.  Out-of-range field values are :func:`_out_of_range`'s job.
 
-    - RECORD LABEL is ``b'RDEF'`` (Table 5-1, offset 0)
-    - END LABEL is ``-99999`` (Table 5-1, offset 172)
+    - RECORD LABEL is ``b'RDEF'`` (Table 5-1)
+    - END LABEL is ``-99999`` (Table 5-1, last 4 bytes)
     - SAMPLE SIZE is valid: 1, 2, 4, 8, or 16 bits (Table 5-1)
     - ``2 * sample_rate * sample_size`` is a multiple of 32 (Table 5-1
       SAMPLE RATE, §5.3.2: 32-bit sample words)
@@ -199,23 +229,30 @@ def _validate_header(
     """
     _validate_label(label, record_index)
 
+    i = record_index
     if end_label != -99999:
-        raise ValueError(f"Invalid RDEF end label: {end_label} | Record {record_index}")
-
-    if sample_size not in _VALID_SAMPLE_SIZES:
-        raise ValueError(f"Invalid sample_size: {sample_size} | Record {record_index}")
-
-    if (2 * sample_rate * sample_size) % 32 != 0:
         raise ValueError(
-            "Packing rule violated: sample word length must be 32 bits "
-            f"| Record {record_index}"
+            f"Record {i}: END LABEL {end_label}, expected -99999 (Table 5-1)"
         )
 
-    expected_length = _HEADER_SIZE + (2 * sample_rate * sample_size) // 8
+    if sample_size not in _VALID_SAMPLE_SIZES:
+        raise ValueError(
+            f"Record {i}: SAMPLE SIZE {sample_size}, "
+            "expected 1, 2, 4, 8 or 16 (Table 5-1)"
+        )
+
+    bits = 2 * sample_rate * sample_size
+    if bits % 32 != 0:
+        raise ValueError(
+            f"Record {i}: 2 * SAMPLE RATE * SAMPLE SIZE = {bits}, "
+            "not a multiple of 32 (Table 5-1, §5.3.2)"
+        )
+
+    expected_length = _HEADER_SIZE + bits // 8
     if record_length != expected_length:
         raise ValueError(
-            f"record_length mismatch: {record_length} != {expected_length} "
-            f"| Record {record_index}"
+            f"Record {i}: RECORD LENGTH {record_length}, expected {expected_length} "
+            f"= {_HEADER_SIZE} + 2 * SAMPLE RATE * SAMPLE SIZE / 8 (Table 5-1)"
         )
 
 
@@ -246,78 +283,38 @@ def unpack_header(f: BinaryIO, record_index: int) -> dict | None:
         If header is truncated
     ValueError
         If header validation fails
+
+    Warns
+    -----
+    UserWarning
+        If a field value is outside Table 5-1's allowed values or §5.2.4
+        (see :func:`_out_of_range`); the header is still returned.
     """
     header_bytes = f.read(_HEADER_SIZE)
     if not header_bytes:
         return None
     if len(header_bytes) < _HEADER_SIZE:
-        raise EOFError("Truncated RDEF header")
+        raise EOFError(
+            f"Record {record_index}: header truncated, "
+            f"{len(header_bytes)} of {_HEADER_SIZE} bytes"
+        )
 
-    (
-        label,
-        record_length,
-        record_version_id,
-        station_id,
-        spacecraft_id,
-        sample_size,
-        sample_rate,
-        validity_flag,
-        agency_flag,
-        rf_to_if_downconv,
-        if_to_channel_downconv,
-        time_tag_year,
-        time_tag_doy,
-        time_tag_second_of_day,
-        time_tag_picoseconds_of_the_second,
-        channel_accumulated_phase,
-        channel_phase_polynomial_coefficient_0,
-        channel_phase_polynomial_coefficient_1,
-        channel_phase_polynomial_coefficient_2,
-        channel_phase_polynomial_coefficient_3,
-        empty_fields_future_extension,
-        empty_fields_internal_agency_use,
-        end_label,
-    ) = _RDEF_HEADER_STRUCT.unpack(header_bytes)
-
+    label, *values, end_label = _RDEF_HEADER_STRUCT.unpack(header_bytes)
+    header = dict(zip(_FIELDS, values, strict=True))
     _validate_header(
         label=label,
         end_label=end_label,
-        record_length=record_length,
-        sample_rate=sample_rate,
-        sample_size=sample_size,
+        record_length=header["record_length"],
+        sample_rate=header["sample_rate"],
+        sample_size=header["sample_size"],
         record_index=record_index,
     )
-
-    header = {
-        "record_length": record_length,
-        "record_version_id": record_version_id,
-        "station_id": station_id,
-        "spacecraft_id": spacecraft_id,
-        "sample_size": sample_size,
-        "sample_rate": sample_rate,
-        "validity_flag": validity_flag,
-        "agency_flag": agency_flag,
-        "rf_to_if_downconv": rf_to_if_downconv,
-        "if_to_channel_downconv": if_to_channel_downconv,
-        "time_tag_year": time_tag_year,
-        "time_tag_doy": time_tag_doy,
-        "time_tag_second_of_day": time_tag_second_of_day,
-        "time_tag_picoseconds_of_the_second": time_tag_picoseconds_of_the_second,
-        "channel_accumulated_phase": channel_accumulated_phase,
-        "channel_phase_polynomial_coefficient_0": channel_phase_polynomial_coefficient_0,  # noqa: E501
-        "channel_phase_polynomial_coefficient_1": channel_phase_polynomial_coefficient_1,  # noqa: E501
-        "channel_phase_polynomial_coefficient_2": channel_phase_polynomial_coefficient_2,  # noqa: E501
-        "channel_phase_polynomial_coefficient_3": channel_phase_polynomial_coefficient_3,  # noqa: E501
-        "empty_fields_future_extension": empty_fields_future_extension,
-        "empty_fields_internal_agency_use": empty_fields_internal_agency_use,
-    }
     bad = _out_of_range(header)
     if bad:
         warnings.warn(
-            f"RDEF record {record_index}: field values outside the allowed range "
-            "(CCSDS 506.1-B-1 Table 5-1, §5.2.4); record read as is:\n"
-            + "\n".join(bad),
-            stacklevel=2,
+            f"Record {record_index}: field values outside the allowed range "
+            "(Table 5-1, §5.2.4); record read as is:\n" + "\n".join(bad),
+            stacklevel=_user_stacklevel(),
         )
     return header
 
@@ -353,14 +350,17 @@ def read_header_length(f: BinaryIO, record_index: int) -> int | None:
     if not buf:
         return None
     if len(buf) < _HEADER_PREFIX_SIZE:
-        raise EOFError("Truncated RDEF header prefix")
+        raise EOFError(
+            f"Record {record_index}: header truncated, "
+            f"{len(buf)} of {_HEADER_PREFIX_SIZE} bytes"
+        )
 
     label, record_length = _RDEF_HEADER_PREFIX_STRUCT.unpack(buf)
     _validate_label(label, record_index)
     if record_length < _HEADER_SIZE:
         raise ValueError(
-            f"RECORD LENGTH {record_length} < {_HEADER_SIZE}-byte minimum "
-            f"header (§5.2, Table 5-1) | Record {record_index}"
+            f"Record {record_index}: RECORD LENGTH {record_length}, "
+            f"less than the {_HEADER_SIZE}-byte header (Table 5-1)"
         )
 
     return record_length
@@ -369,11 +369,6 @@ def read_header_length(f: BinaryIO, record_index: int) -> int | None:
 # =============================================================================
 # I/Q Data Unpacking Functions
 # =============================================================================
-
-
-def _empty_iq(dtype: type | np.dtype) -> tuple[np.ndarray, np.ndarray]:
-    """Return empty I/Q arrays of specified dtype."""
-    return np.empty(0, dtype=dtype), np.empty(0, dtype=dtype)
 
 
 def unpack_iq_16(data: bytes) -> tuple[np.ndarray, np.ndarray]:
@@ -396,18 +391,13 @@ def unpack_iq_16(data: bytes) -> tuple[np.ndarray, np.ndarray]:
 
     Notes
     -----
-    Applies bias correction per §5.3.6 (truncation encoding):
+    Applies the §5.3.6 transform (compensates the §5.3.5 truncation):
     ``out = 2*k + 1``.
-    Input range:  k ∈ [-32768, 32767]
+    Input range:  k in [-32768, 32767]
     Output range: [-65535, 65535] (odd integers only)
     """
-    if not data:
-        return _empty_iq(np.int32)
-
     arr = np.frombuffer(data, dtype="<i2")
     n_pairs = arr.size // 2
-    if n_pairs == 0:
-        return _empty_iq(np.int32)
 
     # 2k+1 computed in int32 directly from the strided int16 view into the
     # contiguous outputs: no interleaved temp, no deinterleave copy.
@@ -440,20 +430,15 @@ def unpack_iq_8(data: bytes) -> tuple[np.ndarray, np.ndarray]:
 
     Notes
     -----
-    Applies bias correction per §5.3.6 (truncation encoding):
+    Applies the §5.3.6 transform (compensates the §5.3.5 truncation):
     ``out = 2*k + 1``.
-    Input range:  k ∈ [-128, 127]
+    Input range:  k in [-128, 127]
     Output range: [-255, 255] (odd integers only)
     """
-    if not data:
-        return _empty_iq(np.int16)
-
     arr = np.frombuffer(data, dtype="<i1")
     n_pairs = arr.size // 2
-    if n_pairs == 0:
-        return _empty_iq(np.int16)
 
-    i = np.empty(n_pairs, dtype=np.int16)
+    i =np.empty(n_pairs, dtype=np.int16)
     q = np.empty(n_pairs, dtype=np.int16)
     np.multiply(arr[0 : 2 * n_pairs : 2], 2, out=i, dtype=np.int16)
     np.multiply(arr[1 : 2 * n_pairs : 2], 2, out=q, dtype=np.int16)
@@ -482,9 +467,9 @@ def unpack_iq_4(data: bytes) -> tuple[np.ndarray, np.ndarray]:
 
     Notes
     -----
-    Applies bias correction per §5.3.6 (truncation encoding):
+    Applies the §5.3.6 transform (compensates the §5.3.5 truncation):
     ``out = 2*k + 1``.
-    Input range:  k ∈ [-8, 7] (4-bit two's complement)
+    Input range:  k in [-8, 7] (4-bit two's complement)
     Output range: [-15, 15] (odd integers only)
     """
     return _unpack_sub_byte(data, 4)
@@ -510,9 +495,9 @@ def unpack_iq_2(data: bytes) -> tuple[np.ndarray, np.ndarray]:
 
     Notes
     -----
-    Applies bias correction per §5.3.6 (truncation encoding):
+    Applies the §5.3.6 transform (compensates the §5.3.5 truncation):
     ``out = 2*k + 1``.
-    Input range:  k ∈ [-2, 1] (2-bit two's complement)
+    Input range:  k in [-2, 1] (2-bit two's complement)
     Output range: [-3, 3] (odd integers only)
     """
     return _unpack_sub_byte(data, 2)
@@ -538,10 +523,10 @@ def unpack_iq_1(data: bytes) -> tuple[np.ndarray, np.ndarray]:
 
     Notes
     -----
-    Applies bias correction per §5.3.6: out = 2*k + 1
-    where k is the 1-bit two's complement value (0 → +1, 1 → −1).
-    Input range:  [0, 1]
-    Output range: [-1, 1]
+    Applies the §5.3.6 transform (compensates the §5.3.5 truncation):
+    ``out = 2*k + 1``.
+    Input range:  k in [-1, 0] (1-bit two's complement: bit 0 -> +1, 1 -> -1)
+    Output range: [-1, 1] (odd integers only)
     """
     return _unpack_sub_byte(data, 1)
 
@@ -551,9 +536,8 @@ def _unpack_sub_byte(data: bytes, bits: int) -> tuple[np.ndarray, np.ndarray]:
     Decode 4-, 2- or 1-bit samples: one table gather per lane.
 
     A byte holds whole complex samples at these sizes, so the decode is
-    ``table[byte]`` for I and for Q (see :func:`_byte_tables`). Measured at
-    20 Msps records this beats per-field shift/mask lookups 1.3x (4-bit) and
-    2.7x (2-bit), and has no temporaries beyond the outputs.
+    ``table[byte]`` for I and for Q (see :func:`_byte_tables`), with no
+    temporaries beyond the outputs.
     """
     byte_arr = np.frombuffer(data, dtype=np.uint8)
     table_i, table_q = _BYTE_TABLES[bits]

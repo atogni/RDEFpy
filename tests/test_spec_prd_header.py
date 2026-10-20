@@ -389,6 +389,8 @@ def test_out_of_range_field_is_read_and_reported(label, overrides, write_prd, ca
     (name, value), = overrides.items()
     got = getattr(pf.records[0].header, name)
     assert got == value or (math.isnan(value) and math.isnan(got))  # read as is
+    mine = [w for w in caught if w.category is UserWarning]
+    assert mine and all(w.filename == __file__ for w in mine)  # points at the caller
     assert label in _reported(capsys, caught)
 
 

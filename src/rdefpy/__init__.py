@@ -30,15 +30,9 @@ tags, and encodes them back. It does not estimate. Spectra, carrier
 tracking and simulation belong to the caller; this package hands them
 correct samples with correct time tags, and depends on NumPy alone.
 
-Successor to the original rdefpy. That library additionally
-carried a ``ComplexSignal`` DSP class, an SPI carrier estimator with a
-Pc/N0 companion, matplotlib record browsers and spectrograms, and pandas
-export. Those were left out on purpose: estimators are not a format's
-job, and matplotlib and pandas do not belong in a byte parser.
-
-Low-level decoding is a verbatim port and is meant to stay that way --
-the ``2k+1`` transform (§5.3.6), the bit offsets, and the header struct
-ARE the format. ``tests/test_rdefpy.py`` pins all five sample sizes.
+Low-level decoding is meant to stay as it is: the ``2k+1`` transform
+(§5.3.6), the bit offsets, and the header struct ARE the format.
+``tests/test_rdefpy.py`` pins all five sample sizes.
 """
 
 from rdefpy.obs import ObservationFile, ProductEntry, Scan, read_observation

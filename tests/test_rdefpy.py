@@ -1,16 +1,14 @@
 """Tests for rdefpy -- CCSDS 506.1-B-1 RDEF reader/writer.
 
-The decisive test here is `test_decode_matches_upstream_reference`. The
-low-level decode was ported verbatim from the original rdefpy and must
-stay bit-exact; REFERENCE below
-was produced by running the ORIGINAL library over the same fixture files
-(both its NumPy and its Cython path, which agreed), so these digests pin
-the port to upstream without depending on it.
+The decisive test here is `test_decode_matches_reference_digests`. The
+low-level decode must stay bit-exact: REFERENCE below holds SHA-256
+digests of the decoded I/Q of each fixture file, so any change to the
+decoded values fails it.
 
-If one of those digests ever fails, the port drifted. Do not update the
+If one of those digests ever fails, the decode drifted. Do not update the
 digest to make it pass -- find out what changed in the decode.
 
-Fixtures in tests/data/ are the rdefpy example products, one per sample
+Fixtures in tests/data/ are simulated example products, one per sample
 size (16, 8, 4, 2, 1 bits), two records each at 2000 sps.
 """
 
@@ -37,11 +35,11 @@ from rdefpy import (
     scan_product,
     write_product,
 )
-from rdefpy.prd import binary
+from rdefpy.prd import _binary as binary
 
 DATA = Path(__file__).parent / "data"
 
-# Digests from the original rdefpy. See module docstring.
+# Reference digests of the decoded I/Q. See module docstring.
 REFERENCE = {
     "EXMPn001tSsDS24r01c01-26039120000.prd": dict(
         sample_size=16, sample_rate=2000, n_records=2,
@@ -83,11 +81,10 @@ FIXTURES = sorted(REFERENCE)
 PRD_16 = DATA / FIXTURES[0]
 
 
-# Integer width the upstream rdefpy stored each sample size at. The
-# digests below were taken over those bytes; we store 4- and 2-bit samples
-# as int8 (the smallest exact type), so hash at the upstream width to keep
-# the pin about VALUES, not storage.
-UPSTREAM_DTYPE = {16: np.int32, 8: np.int16, 4: np.int16, 2: np.int16, 1: np.int8}
+# Integer width the digests are taken at, per sample size. 4- and 2-bit
+# samples are stored as int8 (the smallest exact type) but hashed as int16,
+# so the pin is about VALUES, not storage.
+DIGEST_DTYPE = {16: np.int32, 8: np.int16, 4: np.int16, 2: np.int16, 1: np.int8}
 
 
 def iq_digest(pf):
@@ -95,7 +92,7 @@ def iq_digest(pf):
     h = hashlib.sha256()
     n = 0
     for rec in pf.records:
-        dt = UPSTREAM_DTYPE[rec.data.sample_size]
+        dt = DIGEST_DTYPE[rec.data.sample_size]
         h.update(rec.data.i_samples.astype(dt).tobytes())
         h.update(rec.data.q_samples.astype(dt).tobytes())
         n += len(rec.data)
@@ -103,13 +100,13 @@ def iq_digest(pf):
 
 
 # =============================================================================
-# The port is faithful
+# The decode is pinned
 # =============================================================================
 
 
 @pytest.mark.parametrize("name", FIXTURES)
-def test_decode_matches_upstream_reference(name):
-    """Decoded I/Q is bit-identical to rdefpy's, for all five sample sizes.
+def test_decode_matches_reference_digests(name):
+    """Decoded I/Q matches the reference digests, for all five sample sizes.
 
     Covers the §5.3 bit unpacking and the §5.3.6 ``2k+1`` transform
     together: a sign-extension or bit-offset error in any of the five
@@ -127,7 +124,7 @@ def test_decode_matches_upstream_reference(name):
     sha, n = iq_digest(pf)
     assert n == ref["n_samples"]
     assert sha == ref["sha256"], (
-        f"{name}: decoded I/Q differs from the upstream rdefpy reference. "
+        f"{name}: decoded I/Q differs from the reference digest. "
         "The low-level decode drifted -- do not update this digest."
     )
     assert pf.records[0].data.i_samples[:6].tolist() == ref["i_head"]

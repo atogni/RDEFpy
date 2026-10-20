@@ -51,16 +51,17 @@ TBD.
 
 ## Performance
 
-RDEFpy 0.1.0, 2026-10-19, Intel Core Ultra 9 285HX (one thread), Python 3.11,
-NumPy 2.4, files in OS cache. Time to open a file and decode every sample to
-integer I/Q, real-time ratio in parentheses; the last column also forms
-complex `I + jQ`.
+RDEFpy 0.1.0, 2026-10-19, Intel Core Ultra 9 285HX (large records decoded
+on up to 8 threads), Python 3.11, NumPy 2.4, files in OS cache. Time to open
+a file and decode every sample to integer I/Q, real-time ratio in
+parentheses. Measured on files one tenth of the listed duration and scaled
+by ten.
 
-| Scenario | Rate, bits | Duration | Size | Cython | NumPy only | Cython + complex |
-|---|---|---|---|---|---|---|
-| Navigation | 1 kHz, 16 | 6 h | 90 MB | 0.33 s (65,000×) | 0.40 s (54,000×) | 0.48 s (45,000×) |
-| Radio science | 100 kHz, 16 | 2 h | 2.9 GB | 2.0 s (3,500×) | 2.8 s (2,600×) | 6.1 s (1,200×) |
-| VLBI wideband | 100 MHz, 2 | 60 s | 3.0 GB | 4.3 s (14×) | 14.9 s (4.0×) | 32.0 s (1.9×) |
+| Scenario | Rate, bits | Duration | Size | Cython | NumPy only |
+|---|---|---|---|---|---|
+| Navigation | 1 kHz, 16 | 6 h | 90 MB | 0.27 s (80,000×) | 0.33 s (65,000×) |
+| Radio science | 100 kHz, 16 | 2 h | 2.9 GB | 2.2 s (3,200×) | 3.1 s (2,300×) |
+| VLBI wideband | 100 MHz, 2 | 60 s | 3.0 GB | 1.9 s (31×) | 16.7 s (3.6×) |
 
 The ratios in the introduction come from the IVS GM2026 poster benchmark
 (Cython back-end, earlier version).

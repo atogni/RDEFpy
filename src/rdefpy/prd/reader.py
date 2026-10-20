@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 
 from rdefpy._utils import _Progress, _to_datetime64
-from rdefpy.prd.binary import (
+from rdefpy.prd._binary import (
     _HEADER_PREFIX_SIZE,
     _HEADER_SIZE,
     read_header_length,

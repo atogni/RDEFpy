@@ -21,9 +21,9 @@ iq_to_complex         : I + jQ in one interleaving pass
 Notes
 -----
 Every unpacker must return arrays identical to its NumPy counterpart in
-``binary.py`` (the reference); ``tests/test_spec_prd_samples.py`` runs the
+``_binary.py`` (the reference); ``tests/test_spec_prd_samples.py`` runs the
 whole spec suite against both.  The sub-byte kernels copy their tables from
-``binary._BYTE_TABLES``, so the two paths share a single definition of the
+``_binary._BYTE_TABLES``, so the two paths share a single definition of the
 Table 5-2 layout.  All kernels run without the GIL; large records are
 split across threads (``rdefpy._utils._in_chunks``).
 """
@@ -34,13 +34,13 @@ cimport numpy as cnp
 from libc.stdint cimport int8_t, int16_t, int32_t, uint8_t, uint16_t, uint32_t
 
 from rdefpy._utils import _in_chunks
-from rdefpy.prd.binary import _BYTE_TABLES
+from rdefpy.prd._binary import _BYTE_TABLES
 
 cnp.import_array()
 
 
 # =============================================================================
-# Sub-byte decode tables (copied from binary._BYTE_TABLES at import)
+# Sub-byte decode tables (copied from _binary._BYTE_TABLES at import)
 # =============================================================================
 # Row b of a table holds the 1, 2 or 4 int8 sample values of byte b, packed
 # into one 8-, 16- or 32-bit entry.  A decode stores that entry straight into
