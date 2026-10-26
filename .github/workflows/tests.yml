@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Build (Cython extension)
+        run: uv sync
+      - name: Check the Cython extension was built
+        run: uv run --no-sync python -c "from rdefpy.prd import reader; assert reader._unpack_fast is not None"
+      - name: Tests, Cython
+        run: uv run --no-sync python -m pytest -rs
+
+      # Same install with the compiled extension removed: the NumPy fallback
+      # must import and pass on its own.
+      - name: Remove the Cython extension
+        shell: bash
+        run: rm -f src/rdefpy/prd/unpack_cyth*.so src/rdefpy/prd/unpack_cyth*.pyd
+      - name: Check the extension is gone
+        run: uv run --no-sync python -c "from rdefpy.prd import reader; assert reader._unpack_fast is None"
+      - name: Tests, NumPy only
+        run: uv run --no-sync python -m pytest -rs
