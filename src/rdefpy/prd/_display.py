@@ -18,7 +18,7 @@ Conventions:
   read is what you type.  Derived values (``band``, ``fixed_downconv_hz``,
   ``frequency_steering``) are named for what they are.
 * Units: a label that carries its unit (``duration_s``,
-  ``fixed_downconv_hz``, ``power_db``) is not repeated in the value;
+  ``fixed_downconv_hz``) is not repeated in the value;
   otherwise every physical value shows its unit (Table 5-1 units, in
   plain ASCII: ``turns/s^2``).
 * Numbers: thousands separators, at most six decimals, trailing zeros
@@ -26,7 +26,8 @@ Conventions:
 * Time tags are full ISO 8601 UTC with nanoseconds and a ``Z`` suffix --
   never truncated.
 * Plain text only: no terminal colour codes.  Nothing here prints except
-  ``print_info``, which writes where it is told.
+  the dumps, which write where they are told.  The dumps write raw
+  values: no separators, no units.
 * Rendering never raises on a half-built object; unusable values show as
   ``?``.
 
@@ -86,7 +87,7 @@ _UNITS = {
 
 def _fmt_header_value(name: str, val) -> str:
     """Header value for display: magnitudes get thousands separators."""
-    if name in _NO_GROUPING or isinstance(val, bool) or val is None:
+    if name in _NO_GROUPING:
         return str(val)
     if isinstance(val, int):
         return f"{val:,}"
@@ -124,9 +125,9 @@ def _downlink_band(hdr: RecordHeader) -> str:
     Classify the fixed downconversion frequency into a DSN band.
 
     Returns ``'S'``, ``'X'`` or ``'Ka'`` when ``rf_to_if + if_to_channel``
-    falls in that band's nominal allocation (± guard), else ``'unknown'``.
+    falls in that band's nominal allocation (+/- guard), else ``'unknown'``.
     """
-    # Lazy import avoids a reader<->classes import cycle.
+    # Lazy import: reader -> classes -> _display -> reader is a cycle.
     from rdefpy.prd.reader import _BAND_GUARD_HZ, _DOWNLINK_BANDS_HZ
 
     total = _fixed_downconv_hz(hdr)
@@ -146,9 +147,15 @@ def _steering(hdr: RecordHeader) -> bool:
     )
 
 
-def _reserved_summary(val) -> str:
-    """``<N bytes>`` for a reserved field (0 when unset)."""
-    return f"<{len(val) if isinstance(val, bytes | bytearray) else 0} bytes>"
+def _field_text(name: str, val) -> str:
+    """One header field for display; reserved bytes as a length summary."""
+    if name in _RESERVED and isinstance(val, bytes | bytearray):
+        nonzero = sum(1 for b in val if b)
+        return f"{len(val)} bytes, " + (f"{nonzero} non-zero" if nonzero else "all zero")
+    text = _fmt_header_value(name, val)
+    if val is not None and name in _UNITS:
+        text += " " + _UNITS[name]
+    return text
 
 
 # =============================================================================
@@ -191,18 +198,7 @@ def product_repr(pf: ProductFile) -> str:
 
 def header_str(hdr: RecordHeader) -> str:
     """Every Table 5-1 field by attribute name, then the derived ``timetag``."""
-    rows = []
-    for name in type(hdr).__slots__:
-        val = getattr(hdr, name)
-        if name in _RESERVED and isinstance(val, bytes | bytearray):
-            nonzero = sum(1 for b in val if b)
-            text = f"{len(val)} bytes, " + (f"{nonzero} non-zero" if nonzero else "all zero")
-            rows.append((name, text))
-        else:
-            text = _fmt_header_value(name, val)
-            if val is not None and name in _UNITS:
-                text += " " + _UNITS[name]
-            rows.append((name, text))
+    rows = [(name, _field_text(name, getattr(hdr, name))) for name in type(hdr).__slots__]
     rows.append(("timetag", _fmt_timetag(hdr)))
     return "RecordHeader\n" + _align_rows(rows, indent="  ")
 
@@ -287,7 +283,7 @@ def product_str(pf: ProductFile) -> str:
         # 1 s record spacing (§5.1) on full time tags: crosses year
         # boundaries and includes picoseconds.
         dt_sec = np.diff(tt) / np.timedelta64(1, "s")
-        if dt_sec.size == 0 or np.allclose(dt_sec, 1.0, atol=1e-6):
+        if dt_sec.size == 0 or np.allclose(dt_sec, 1.0, rtol=0, atol=1e-6):
             consecutive = "True"
         else:
             consecutive = f"False (min dt {dt_sec.min():.6f} s, max dt {dt_sec.max():.6f} s)"
@@ -317,11 +313,6 @@ def product_str(pf: ProductFile) -> str:
 # =============================================================================
 
 
-def print_info(pf: ProductFile, buf: TextIO | None = None) -> None:
-    """Write :func:`product_str` to *buf* (default: standard output)."""
-    print(product_str(pf), file=buf)
-
-
 def _target(dest: str | os.PathLike | TextIO | None):
     """Where a dump goes: stdout for None, a new UTF-8 file for a path,
     else the given text stream (left open, as the caller owns it)."""
@@ -332,40 +323,29 @@ def _target(dest: str | os.PathLike | TextIO | None):
     return nullcontext(dest)
 
 
-def _write_header_block(f, hdr: RecordHeader) -> None:
-    for field in type(hdr).__slots__:
-        val = getattr(hdr, field)
-        text = _reserved_summary(val) if field in _RESERVED else val
-        f.write(f"  {field}: {text}\n")
-    f.write("\n")
-
-
-def dump_headers(pf: ProductFile, dest: str | os.PathLike | TextIO | None = None) -> None:
-    """Write every record header as text (see ``ProductFile.dump_headers``)."""
+def dump(
+    pf: ProductFile, dest: str | os.PathLike | TextIO | None = None, *, data: bool = True
+) -> None:
+    """Write headers, and I/Q pairs if *data*, as text (see
+    ``ProductFile.dump`` / ``ProductFile.dump_headers``)."""
     with _target(dest) as f:
-        f.write(f"RDEF Header Dump -- {len(pf.records)} records\n")
+        f.write(f"RDEF {'Full' if data else 'Header'} Dump -- {len(pf.records)} records\n")
         f.write("=" * 70 + "\n\n")
         for idx, rec in enumerate(pf.records):
-            f.write(f"Record {idx}\n")
+            f.write(f"Record {idx}" + (" -- Header\n" if data else "\n"))
             f.write("-" * 40 + "\n")
-            _write_header_block(f, rec.header)
+            for field in type(rec.header).__slots__:
+                val = getattr(rec.header, field)
+                text = _field_text(field, val) if field in _RESERVED else val
+                f.write(f"  {field}: {text}\n")
+            f.write("\n")
+            if not data:
+                continue
 
-
-def dump(pf: ProductFile, dest: str | os.PathLike | TextIO | None = None) -> None:
-    """Write headers and I/Q pairs as text (see ``ProductFile.dump``)."""
-    with _target(dest) as f:
-        f.write(f"RDEF Full Dump -- {len(pf.records)} records\n")
-        f.write("=" * 70 + "\n\n")
-        for idx, rec in enumerate(pf.records):
-            f.write(f"Record {idx} -- Header\n")
+            d = rec.data  # one read per record when it is not loaded
+            f.write(f"Record {idx} -- Data ({len(d)} samples)\n")
             f.write("-" * 40 + "\n")
-            _write_header_block(f, rec.header)
-
-            data = rec.data  # one read per record when it is not loaded
-            n = len(data)
-            f.write(f"Record {idx} -- Data ({n} samples)\n")
-            f.write("-" * 40 + "\n")
-            i_arr, q_arr = data.i_samples, data.q_samples
-            for s in range(n):
-                f.write(f"  {i_arr[s]}, {q_arr[s]}\n")
+            f.writelines(
+                f"  {i}, {q}\n" for i, q in zip(d.i_samples.tolist(), d.q_samples.tolist())
+            )
             f.write("\n")

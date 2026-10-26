@@ -698,6 +698,22 @@ def test_str_and_repr_are_ascii():
             assert text.isascii(), (type(obj).__name__, text)
 
 
+def test_dump_and_dump_headers():
+    pf = read_product(PRD_16).slice(0, 1)
+    rec = pf[0]
+    for data in (True, False):
+        buf = io.StringIO()
+        (pf.dump if data else pf.dump_headers)(buf)
+        lines = buf.getvalue().splitlines()
+        assert lines[0] == f"RDEF {'Full' if data else 'Header'} Dump -- 1 records"
+        assert lines[3] == ("Record 0 -- Header" if data else "Record 0")
+        assert "  empty_fields_future_extension: 36 bytes, all zero" in lines
+        assert f"  station_id: {rec.header.station_id}" in lines
+        iq = f"  {rec.data.i_samples[0]}, {rec.data.q_samples[0]}"
+        assert (iq in lines) is data
+    assert len(lines) == 5 + 21 + 1  # title, rule, blank, label, rule; 21 fields; blank
+
+
 def test_record_data_summary_makes_no_pass_over_the_samples(monkeypatch):
     def boom(self):
         raise AssertionError("str(RecordData) touched the samples")

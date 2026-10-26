@@ -1026,7 +1026,7 @@ class ProductFile:
             Where to write (``sys.stdout`` when None), as in
             ``pandas.DataFrame.info``.
         """
-        _display.print_info(self, buf)
+        print(_display.product_str(self), file=buf)
 
     # ---- header editing -----------------------------------------------
 
@@ -1496,7 +1496,7 @@ class ProductFile:
         >>> pf.dump_headers()                 # terminal
         >>> pf.dump_headers("headers.txt")    # file
         """
-        _display.dump_headers(self, dest)
+        _display.dump(self, dest, data=False)
 
     def dump(self, dest: str | Path | TextIO | None = None) -> None:
         """
