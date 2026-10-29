@@ -412,8 +412,8 @@ def read_product(
         header fields do not match **all** filters are skipped without
         reading their data.
     min_downconv_hz, max_downconv_hz : float, optional
-        Total downconversion-frequency window in Hz, evaluated at the first
-        sample (t = 0) as
+        Total downconversion-frequency window in Hz, evaluated at the second
+        boundary (t = 0) as
         ``rf_to_if_downconv + if_to_channel_downconv + c1``.
     band : {"S", "X", "Ka"}, optional
         Select records by downlink RF band (case-insensitive).  Convenience
