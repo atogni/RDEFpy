@@ -132,7 +132,8 @@ def _phase_terms(header: RecordHeader) -> tuple[float, float, float, float, floa
 
 def _downconv_hz(header: RecordHeader, t):
     """
-    Total downconversion frequency in Hz at *t* seconds from the record start.
+    Total downconversion frequency in Hz at *t* seconds from the second
+    boundary (TIME TAG SECOND OF DAY).
 
     ``f_DC(t) = (rf_to_if + if_to_channel) + (c1 + 2*c2*t + 3*c3*t**2)``
     (§5.2.6).  *t* is a float or an array.  Every downconversion frequency
@@ -145,7 +146,8 @@ def _downconv_hz(header: RecordHeader, t):
 
 def _downconv_phase(header: RecordHeader, t):
     """
-    Downconversion phase in turns at *t* seconds from the record start.
+    Downconversion phase in turns at *t* seconds from the second boundary
+    (TIME TAG SECOND OF DAY).
 
     ``phi(t) = Phi + c0 + c1*t + c2*t**2 + c3*t**3`` (§5.2.6), where ``Phi``
     (CHANNEL ACCUMULATED PHASE) already includes the fixed downconverter.
@@ -163,6 +165,17 @@ def _header_sample_rate(header: RecordHeader) -> float:
     if fs <= 0:
         raise ValueError(f"Invalid sample rate: {fs} Hz")
     return fs
+
+
+def _sample_times(header: RecordHeader, n: int) -> np.ndarray:
+    """
+    Times in s of the *n* samples from the second boundary (§5.2.6.2).
+
+    The first sample lies TIME TAG PICOSECONDS OF THE SECOND after it
+    (Table 5-1; unset counts as 0, "set to 0 if unknown").
+    """
+    ps = header.time_tag_picoseconds_of_the_second or 0.0
+    return float(ps) * 1e-12 + np.arange(n, dtype=np.float64) / _header_sample_rate(header)
 
 
 def _record_epoch(header: RecordHeader) -> np.datetime64 | None:
@@ -228,7 +241,7 @@ class RecordHeader:
     time_tag_picoseconds_of_the_second : float
         Sub-second precision in picoseconds.
     channel_accumulated_phase : float
-        Accumulated phase in turns at record start (§5.2.6).
+        Accumulated phase in turns at the second boundary (§5.2.6).
     channel_phase_polynomial_coefficient_0 : float
         Phase polynomial coefficient c0 in turns (§5.2.6).
     channel_phase_polynomial_coefficient_1 : float
@@ -872,8 +885,10 @@ class Record:
 
         Notes
         -----
-        - Time reference t0 is the start of the record (time_tag_second_of_day).
-        - Sample times are measured in seconds from the record start.
+        - Time reference t0 is the second boundary (time_tag_second_of_day);
+          the coefficients are referred to it (Table 5-1).
+        - Sample times are ``ps*1e-12 + k/fs``: the first sample lies
+          time_tag_picoseconds_of_the_second after t0.
         - Phase polynomial coefficients are in turns/s (Hz for c1), turns/s²
           for c2, and turns/s³ for c3.
         - Per §5.2.6, the fixed IF-to-channel downconverter is assumed to
@@ -886,8 +901,7 @@ class Record:
         n_samples = len(self)
         if n_samples == 0:
             return np.array([], dtype=np.float64)
-        fs = _header_sample_rate(self.header)
-        return _downconv_hz(self.header, np.arange(n_samples, dtype=np.float64) / fs)
+        return _downconv_hz(self.header, _sample_times(self.header, n_samples))
 
     @property
     def downconversion_phase(self) -> np.ndarray:
@@ -902,7 +916,9 @@ class Record:
         where ``Φ`` is CHANNEL ACCUMULATED PHASE (which already
         incorporates the fixed downconverter contribution), ``c0-c3``
         are the CHANNEL PHASE POLYNOMIAL COEFFICIENTS, and ``t`` is
-        measured from the record start.
+        measured from the second boundary (time_tag_second_of_day), so
+        sample k sits at ``ps*1e-12 + k/fs`` with ``ps`` the
+        time_tag_picoseconds_of_the_second (Table 5-1).
 
         The fixed-part phase ramp (from ``rf_to_if_downconv`` and
         ``if_to_channel_downconv``) is not computed separately because
@@ -920,8 +936,7 @@ class Record:
         n_samples = len(self)
         if n_samples == 0:
             return np.array([], dtype=np.float64)
-        fs = _header_sample_rate(self.header)
-        return _downconv_phase(self.header, np.arange(n_samples, dtype=np.float64) / fs)
+        return _downconv_phase(self.header, _sample_times(self.header, n_samples))
 
 
 def _load_records(records, *, progress: bool = False) -> None:
@@ -1278,7 +1293,7 @@ class ProductFile:
             expected values.  Records must match **all** filters.
         min_downconv_hz : float, optional
             Minimum total downconversion frequency in Hz.  Evaluated
-            at the first sample of each record (t = 0) as
+            at each record's second boundary (t = 0) as
             ``rf_to_if_downconv + if_to_channel_downconv + c1``.
         max_downconv_hz : float, optional
             Maximum total downconversion frequency in Hz.
@@ -1389,7 +1404,7 @@ class ProductFile:
         Per-record downconversion frequency at each record's start (header-only).
 
         One value per record: the total downconversion frequency evaluated
-        at the record start (t = 0),
+        at the record start (t = 0, the second boundary),
 
             f = rf_to_if_downconv + if_to_channel_downconv + c1   [Hz]
 
@@ -1419,7 +1434,7 @@ class ProductFile:
         Per-record downconversion phase at each record's start (header-only).
 
         One value per record: the downconversion phase at the record start
-        (t = 0),
+        (t = 0, the second boundary),
 
             φ = Φ + c0   [turns]
 

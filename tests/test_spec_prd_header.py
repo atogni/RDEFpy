@@ -604,19 +604,12 @@ def test_downconversion_polynomials_at_zero_picoseconds():
                                fixed + 100 + 20 * t + 3 * t**2, rtol=0, atol=1e-3)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="§5.2.6.2/Table 5-1: c0..c3 refer to the second boundary; with a "
-    "nonzero picoseconds offset the library evaluates the polynomial at k/fs "
-    "instead of ps*1e-12 + k/fs.",
-)
 def test_downconversion_phase_counts_the_picosecond_offset():
     t = _tau()
     np.testing.assert_allclose(_ps_record().downconversion_phase,
                                5.0 + 0.25 + 100 * t + 10 * t**2 + t**3, rtol=0, atol=1e-9)
 
 
-@pytest.mark.xfail(strict=True, reason="same as test_downconversion_phase_counts_the_picosecond_offset")
 def test_downconversion_frequency_counts_the_picosecond_offset():
     rec = _ps_record()
     t = _tau()
