@@ -133,8 +133,13 @@ def _decode_iq(
     Raises
     ------
     ValueError
-        If *sample_size* is not supported.
+        If *sample_size* is not supported, or *data_bytes* is not whole
+        32-bit words (§5.3.2).  Both decoders would drop a partial word.
     """
+    if len(data_bytes) % 4:
+        raise ValueError(
+            f"I/Q data of {len(data_bytes)} bytes is not whole 32-bit words (§5.3.2)"
+        )
     if _unpack_fast is not None and sample_size in _UNPACKERS:
         return _unpack_fast(data_bytes, sample_size)
     unpacker = _UNPACKERS.get(sample_size)

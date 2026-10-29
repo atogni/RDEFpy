@@ -80,7 +80,7 @@ from rdefpy.prd._binary import (
     _VALID_SAMPLE_SIZES,
     _out_of_range,
 )
-from rdefpy.prd.classes import ProductFile, Record, RecordHeader
+from rdefpy.prd.classes import _FULL_SCALE, ProductFile, Record, RecordHeader
 
 # =============================================================================
 # Constants
@@ -222,11 +222,26 @@ def _prepare_empty_fields(header: RecordHeader) -> tuple[bytes, bytes]:
 # =============================================================================
 
 
-def _invert_bias(
-    y: np.ndarray, sample_size: int, min_val: int, max_val: int
-) -> np.ndarray:
+def _check_samples(y: np.ndarray, sample_size: int, name: str) -> None:
     """
-    Invert bias correction per §5.3.6: y = 2*k + 1 → k, clipped to valid range.
+    Raise unless every value of *y* is a valid ``2k+1`` sample (§5.3.6).
+
+    Valid means odd and within ``±(2**sample_size - 1)``.  Anything else
+    has no on-disk code; writing it would need clipping or rounding, i.e.
+    a silent change to the samples, so it is an error instead.
+    """
+    lim = _FULL_SCALE[sample_size]
+    if y.size and (y.min() < -lim or y.max() > lim or not (y & 1).all()):
+        raise ValueError(
+            f"{name} samples are not valid 2k+1 values for "
+            f"sample_size={sample_size}: every value must be odd and within "
+            f"±{lim} (§5.3.6)"
+        )
+
+
+def _invert_bias(y: np.ndarray) -> np.ndarray:
+    """
+    Invert bias correction per §5.3.6: y = 2*k + 1 → k.
 
     This is the inverse of the truncation encoding applied during reading.
     Converts from the expanded ``2k+1`` representation back to on-disk format.
@@ -234,29 +249,22 @@ def _invert_bias(
     Parameters
     ----------
     y : np.ndarray
-        Bias-corrected values (y = 2*k + 1)
-    sample_size : int
-        Bits per sample (determines output dtype)
-    min_val : int
-        Minimum valid value for k
-    max_val : int
-        Maximum valid value for k
+        Bias-corrected values (y = 2*k + 1), already checked by
+        ``_check_samples``.
 
     Returns
     -------
     k : np.ndarray
-        Original values, clipped
+        Original values, a new array.
 
     Notes
     -----
-    Computed in the dtype of *y*, which holds every value involved.  The
-    result is k, still in that dtype; the caller narrows it on store.
+    Computed in the dtype of *y*, which holds every value involved (the
+    smallest, ``y - 1 = -2**sample_size``, fits).  The result is k, still in
+    that dtype; the caller narrows it on store.
     """
-    # Clipping y to [2*min+1, 2*max+1] first gives the same k as clipping
-    # floor((y-1)/2) to [min, max] (both maps are monotone), and keeps y-1
-    # from overflowing.  >> 1 on a signed integer is floor division by 2.
-    k = np.clip(y, 2 * min_val + 1, 2 * max_val + 1)
-    k -= 1
+    # >> 1 on a signed integer is floor division by 2.
+    k = y - 1
     k >>= 1
     return k
 
@@ -471,6 +479,9 @@ def pack_record_data(rec: Record) -> bytes:
 
     i_vals = data.i_samples
     q_vals = data.q_samples
+    if sample_size in _FULL_SCALE:
+        _check_samples(i_vals, sample_size, "I")
+        _check_samples(q_vals, sample_size, "Q")
 
     # =========================================================================
     # 16-bit Sample Packing
@@ -485,8 +496,8 @@ def pack_record_data(rec: Record) -> bytes:
             )
 
         # Invert bias: y = 2*k + 1 → k
-        i_raw = _invert_bias(i_vals, 16, -32768, 32767)  # int16
-        q_raw = _invert_bias(q_vals, 16, -32768, 32767)  # int16
+        i_raw = _invert_bias(i_vals)  # int16
+        q_raw = _invert_bias(q_vals)  # int16
 
         # Interleave: I1, Q1, I2, Q2, ...
         interleaved = np.empty(2 * n_complex, dtype="<i2")
@@ -508,8 +519,8 @@ def pack_record_data(rec: Record) -> bytes:
             )
 
         # Invert bias: y = 2*k + 1 → k
-        i_raw = _invert_bias(i_vals, 8, -128, 127)  # int8
-        q_raw = _invert_bias(q_vals, 8, -128, 127)  # int8
+        i_raw = _invert_bias(i_vals)  # int8
+        q_raw = _invert_bias(q_vals)  # int8
 
         # Interleave: I1, Q1, I2, Q2, ...
         interleaved = np.empty(2 * n_complex, dtype="<i1")
@@ -531,8 +542,8 @@ def pack_record_data(rec: Record) -> bytes:
             )
 
         # Invert bias: y = 2*k + 1 → k in [-8, 7]
-        i_k = _invert_bias(i_vals, 4, -8, 7)
-        q_k = _invert_bias(q_vals, 4, -8, 7)
+        i_k = _invert_bias(i_vals)
+        q_k = _invert_bias(q_vals)
 
         # Pack nibbles into bytes with contiguous packing per §5.3:
         # Byte layout: [Q3 Q2 Q1 Q0] [I3 I2 I1 I0] (MSB -> LSB)
@@ -557,8 +568,8 @@ def pack_record_data(rec: Record) -> bytes:
             )
 
         # Invert bias: y = 2*k + 1 → k in [-2, 1]
-        i_k = _invert_bias(i_vals, 2, -2, 1)
-        q_k = _invert_bias(q_vals, 2, -2, 1)
+        i_k = _invert_bias(i_vals)
+        q_k = _invert_bias(q_vals)
 
         # The low 2 bits of int8 k are its 2-bit two's-complement code:
         # 0 → 00, 1 → 01, -2 → 10, -1 → 11.  One nibble per pair, Q above I.

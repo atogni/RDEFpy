@@ -182,7 +182,9 @@ def _out_of_range(h: dict) -> list[str]:
     - AGENCY FLAG outside 0-3
     - TIME TAG DOY outside 1-366
     - TIME TAG SECOND OF DAY outside 0-86400
-    - TIME TAG PICOSECONDS negative ("positive non-zero ... or 0")
+    - TIME TAG PICOSECONDS negative ("positive non-zero ... or 0") or a
+      whole second or more (it is picoseconds *of the second*)
+    - SAMPLE RATE 0: no data, but a record holds one second of it (§5.1.1)
     - any float64 field NaN, -Inf, +Inf or -0 (§5.2.4)
     """
     bad = []
@@ -195,9 +197,11 @@ def _out_of_range(h: dict) -> list[str]:
     if not 0 <= h["time_tag_second_of_day"] <= 86400:
         bad.append(f"  - TIME TAG SECOND OF DAY: {h['time_tag_second_of_day']} "
                    "(valid range: 0-86400)")
-    if h["time_tag_picoseconds_of_the_second"] < 0:
-        bad.append("  - TIME TAG PICOSECONDS: "
-                   f"{h['time_tag_picoseconds_of_the_second']} (must be >= 0)")
+    ps = h["time_tag_picoseconds_of_the_second"]
+    if ps < 0 or ps >= 1e12:  # NaN fails both: reported by the float check
+        bad.append(f"  - TIME TAG PICOSECONDS: {ps} (valid range: 0 to < 1e12)")
+    if h["sample_rate"] == 0:
+        bad.append("  - SAMPLE RATE: 0 (a record holds one second of data, §5.1.1)")
     for f in _FLOAT_FIELDS:
         v = h[f]
         if not math.isfinite(v) or (v == 0 and math.copysign(1.0, v) < 0):
@@ -396,7 +400,8 @@ def unpack_iq_16(data: bytes) -> tuple[np.ndarray, np.ndarray]:
     Input range:  k in [-32768, 32767]
     Output range: [-65535, 65535] (odd integers only)
     """
-    arr = np.frombuffer(data, dtype="<i2")
+    # count=: a trailing odd byte is ignored, as in unpack_iq_cython.
+    arr = np.frombuffer(data, dtype="<i2", count=len(data) // 2)
     n_pairs = arr.size // 2
 
     # 2k+1 computed in int32 directly from the strided int16 view into the
@@ -438,7 +443,7 @@ def unpack_iq_8(data: bytes) -> tuple[np.ndarray, np.ndarray]:
     arr = np.frombuffer(data, dtype="<i1")
     n_pairs = arr.size // 2
 
-    i =np.empty(n_pairs, dtype=np.int16)
+    i = np.empty(n_pairs, dtype=np.int16)
     q = np.empty(n_pairs, dtype=np.int16)
     np.multiply(arr[0 : 2 * n_pairs : 2], 2, out=i, dtype=np.int16)
     np.multiply(arr[1 : 2 * n_pairs : 2], 2, out=q, dtype=np.int16)

@@ -369,6 +369,8 @@ SOFT = {
     "doy 367": ("DOY", dict(time_tag_doy=367)),
     "sod 86401": ("SECOND OF DAY", dict(time_tag_second_of_day=86401)),
     "picoseconds -1": ("PICOSECONDS", dict(time_tag_picoseconds_of_the_second=-1.0)),
+    "picoseconds 1e12": ("PICOSECONDS", dict(time_tag_picoseconds_of_the_second=1e12)),
+    "sample rate 0": ("SAMPLE RATE", dict(sample_rate=0)),
     **{f"{f} {b}": (f"{f}: {v!r}", {f: v}) for f in spec.FLOAT_FIELDS
        for b, v in (("nan", math.nan), ("-inf", -math.inf), ("-0", -0.0))},
 }
@@ -399,6 +401,7 @@ IN_RANGE = {
     "doy 366": dict(time_tag_doy=366),
     "sod 0": dict(time_tag_second_of_day=0),
     "sod 86400": dict(time_tag_second_of_day=86400),
+    "picoseconds 1e12 - 1": dict(time_tag_picoseconds_of_the_second=1e12 - 1),
     **{f"agency {a}": dict(agency_flag=a) for a in range(4)},
     "validity 65535": dict(validity_flag=65535),
 }
@@ -433,7 +436,7 @@ def test_writer_writes_negative_zero_as_positive_zero(field):
     assert packed[off : off + 8] == struct.pack("<d", 0.0)
 
 
-@pytest.mark.parametrize("label,overrides", list(SOFT.values())[:7], ids=list(SOFT)[:7])
+@pytest.mark.parametrize("label,overrides", list(SOFT.values())[:8], ids=list(SOFT)[:8])
 def test_writer_rejects_out_of_range_fields(label, overrides):
     """What the reader only reports (Table 5-1 allowed values), the writer refuses."""
     with pytest.raises(ValueError, match=label):

@@ -267,6 +267,42 @@ def test_any_valid_values_survive_write_then_read(bits, decode_path, tmp_path):
     assert i.tolist() == v_i and q.tolist() == v_q
 
 
+@pytest.mark.parametrize("bits", BITS)
+def test_writer_refuses_values_with_no_code(bits, tmp_path):
+    """§5.3.6: only odd values within ±(2**bits - 1) have a code.  The writer
+    refuses the rest instead of clipping or rounding them."""
+    lim = 2**bits - 1
+    rate = spec.per_word(bits)
+    ok = np.ones(rate, dtype=STORAGE[bits])
+    for bad in (lim + 2, -lim - 2, 0):
+        v = ok.copy()
+        v[-1] = bad
+        pf = _product([(dict(sample_size=bits, sample_rate=rate), ok, v)])
+        with pytest.raises(ValueError, match="2k\\+1"):
+            write_product(tmp_path / "x.prd", pf)
+
+
+@pytest.mark.parametrize("bits", BITS)
+def test_record_data_refuses_a_lossy_cast(bits):
+    """Samples are stored exactly as given or not at all: no wrap, no
+    truncation."""
+    wraps = int(np.iinfo(STORAGE[bits]).max) + 2
+    for bad in ([wraps], [2.5], [np.nan]):
+        with pytest.raises(ValueError):
+            RecordData(bits, 1, bad, [1])
+        rd = RecordData(bits, 1, [1], [1])
+        with pytest.raises(ValueError):
+            rd.i_samples = bad
+        with pytest.raises(ValueError):
+            rd.q_samples = bad
+
+
+def test_record_data_keeps_storage_dtype_input_uncopied():
+    v = np.ones(4, dtype=np.int32)
+    rd = RecordData(16, 4, v, v)
+    assert rd.i_samples is v and rd.q_samples is v
+
+
 def test_16_bit_full_code_range_both_directions(decode_path, write_prd, tmp_path):
     """All 65536 sixteen-bit codes, for I and (reversed) for Q."""
     k = np.arange(-32768, 32768, dtype=np.int64)

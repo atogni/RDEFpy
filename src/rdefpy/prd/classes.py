@@ -81,7 +81,7 @@ _HEADER_FIELDS = (
 _HEADER_FIELD_SET = frozenset(_HEADER_FIELDS)
 
 # Maximum absolute sample value per bit-depth after the 2k+1 transform (§5.3.6).
-_SATURATION_THRESHOLD: dict[int, int] = {
+_FULL_SCALE: dict[int, int] = {
     1: 1,
     2: 3,
     4: 15,
@@ -120,7 +120,7 @@ def _fixed_downconv_hz(header: RecordHeader) -> float:
     return float(rf) + float(ifc)
 
 
-def _phase_terms(header: RecordHeader) -> tuple[float, float, float, float, float]:
+def _phase_terms(header: RecordHeader) -> tuple[float, ...]:
     """
     ``(Phi, c0, c1, c2, c3)`` from the header (§5.2.6).
 
@@ -186,9 +186,11 @@ def _record_epoch(header: RecordHeader) -> np.datetime64 | None:
         return None
 
 
-# Header fields that must be the same in every record of a product file:
-# one scan, one channel, one station (§5).  Checked when a file is read and
-# when two files are concatenated.
+# Header fields that must be the same in every record of a product file.
+# One station, scan and channel per file is the spec (§3.2.2.2-4, §5.1.3);
+# sample size/rate, agency flag and version are held fixed by this package,
+# not by the spec.  Checked when a file is read and when two files are
+# concatenated.
 _FILE_CONSTANT_FIELDS = (
     "station_id",
     "spacecraft_id",
@@ -225,7 +227,8 @@ class RecordHeader:
     sample_rate : int
         Complex samples per second.
     validity_flag : int
-        0 = no error.
+        0 = no error, or no check performed; a positive value is an
+        implementation-dependent error code (Table 5-1).
     agency_flag : int
         0=unused, 1=ESA, 2=JAXA, 3=NASA.
     rf_to_if_downconv : float
@@ -237,11 +240,13 @@ class RecordHeader:
     time_tag_doy : int
         Time tag day of year (1-366).
     time_tag_second_of_day : int
-        Time tag second of day (0-86400).
+        Time tag second of day (0-86400; 86400 is a leap second).
     time_tag_picoseconds_of_the_second : float
-        Sub-second precision in picoseconds.
+        Picoseconds of the second of the first sample in the record
+        (Table 5-1); 0 if unknown.
     channel_accumulated_phase : float
-        Accumulated phase in turns at the second boundary (§5.2.6).
+        Integer part (whole turns) of the accumulated downconverter phase at
+        the second boundary (§5.2.6.2).
     channel_phase_polynomial_coefficient_0 : float
         Phase polynomial coefficient c0 in turns (§5.2.6).
     channel_phase_polynomial_coefficient_1 : float
@@ -321,7 +326,7 @@ class RecordHeader:
     @property
     def timetag(self) -> np.datetime64:
         """
-        Record time tag as a ``numpy.datetime64[ns]``.
+        Time of the record's first sample as a ``numpy.datetime64[ns]``.
 
         Combines the header time-tag fields (year, day-of-year,
         second-of-day, and picoseconds-of-the-second) into a single
@@ -330,10 +335,15 @@ class RecordHeader:
         float64 (Table 5-1), and a value one ulp below a whole nanosecond
         must not lose that nanosecond.
 
+        The time scale is station time, an approximation to UTC (§5.2.5).
+        NumPy has no leap seconds: a leap-second record (SECOND OF DAY
+        86400) gets the same tag as SECOND OF DAY 0 of the next day.  The
+        header fields themselves keep the two apart.
+
         Returns
         -------
         numpy.datetime64
-            UTC timestamp with ``datetime64[ns]`` precision.
+            Station-time timestamp with ``datetime64[ns]`` precision.
         """
         base = np.datetime64(f"{int(self.time_tag_year):04d}-01-01", "ns")
         base += np.timedelta64(int(self.time_tag_doy) - 1, "D")
@@ -383,8 +393,8 @@ class RecordData:
     """
 
     __slots__ = (
-        "sample_size", "sample_rate", "dtype", "_i", "_q", "complex_dtype", "_x",
-        "__weakref__",
+        "__weakref__", "_i", "_q",
+        "complex_dtype", "dtype", "sample_rate", "sample_size",
     )
 
     def __init__(
@@ -429,14 +439,13 @@ class RecordData:
             raise ValueError(
                 "i_samples and q_samples must be both provided or both None"
             )
-        self._x: np.ndarray | None = None  # cached complex view, see samples
         if i_samples is None:
             self._i = np.empty(0, dtype=self.dtype)
             self._q = np.empty(0, dtype=self.dtype)
             return
 
-        i_arr = np.asarray(i_samples, dtype=self.dtype)
-        q_arr = np.asarray(q_samples, dtype=self.dtype)
+        i_arr = self._as_storage(i_samples)
+        q_arr = self._as_storage(q_samples)
         if i_arr.shape != q_arr.shape:
             raise ValueError("i_samples and q_samples must have the same shape")
         self._i = i_arr
@@ -464,6 +473,39 @@ class RecordData:
             )
         return self.sample_rate
 
+    def _as_storage(self, value) -> np.ndarray:
+        """
+        *value* as ``self.dtype``; raises if the cast would change a value.
+
+        Same-dtype input (the reader's) passes through uncopied and
+        unchecked.  Anything else is cast and compared, so a wrap (300 ->
+        44 in int8) or a truncation (2.7 -> 2) is an error, not a silent
+        change to the samples.
+        """
+        arr = np.asarray(value)
+        if arr.ndim != 1:
+            raise ValueError(f"samples must be 1-D, got shape {arr.shape}")
+        if arr.dtype == self.dtype:
+            return arr
+        with np.errstate(invalid="ignore"):  # NaN/inf: caught just below
+            out = arr.astype(self.dtype)
+        if not np.array_equal(out, arr):
+            raise ValueError(
+                f"samples do not fit {np.dtype(self.dtype)} exactly "
+                f"(sample_size={self.sample_size}): non-integer or out of "
+                "range values; quantize to 2k+1 integers first (§5.3.6)"
+            )
+        return out
+
+    def _pair(self) -> tuple[np.ndarray, np.ndarray]:
+        """``(I, Q)``; raises if only one of them has been set."""
+        if self._i.shape != self._q.shape:
+            raise ValueError(
+                f"I has {self._i.size} samples and Q {self._q.size}: "
+                "set both i_samples and q_samples"
+            )
+        return self._i, self._q
+
     # ---- I/Q access ---------------------------------------------------
 
     @property
@@ -473,11 +515,10 @@ class RecordData:
 
     @i_samples.setter
     def i_samples(self, value: np.ndarray) -> None:
-        arr = np.asarray(value, dtype=self.dtype)
+        arr = self._as_storage(value)
         if self._q.size != 0 and arr.shape != self._q.shape:
             raise ValueError("New I array shape does not match existing Q")
         self._i = arr
-        self._x = None
 
     @property
     def q_samples(self) -> np.ndarray:
@@ -486,11 +527,10 @@ class RecordData:
 
     @q_samples.setter
     def q_samples(self, value: np.ndarray) -> None:
-        arr = np.asarray(value, dtype=self.dtype)
+        arr = self._as_storage(value)
         if self._i.size != 0 and arr.shape != self._i.shape:
             raise ValueError("New Q array shape does not match existing I")
         self._q = arr
-        self._x = None
 
     @property
     def samples(self) -> np.ndarray:
@@ -505,163 +545,134 @@ class RecordData:
         window, no scaling: on an open-loop recording the carrier can sit in
         the DC bin, where "harmless" DC removal would delete the signal.
 
-        Built once and cached (5 ms per 1e6 samples at complex128), so
-        repeated access is free.  The array is READ-ONLY for that reason:
-        every caller shares it, and an in-place taper or mean removal would
-        silently alter the record for everyone after.  Copy first if you
-        must modify: ``x = rec.data.samples.copy()``.  Assigning
-        ``i_samples`` / ``q_samples`` invalidates the cache.
+        Built anew on every access, from the current I and Q, so it always
+        matches them, in-place edits included.  The cost is paid each time
+        (about 5 ms per 1e6 samples at complex128; 15 ms for a 20 Msps record,
+        9 ms at complex64): take ``x = rec.data.samples`` once and reuse
+        ``x``.  The result is the caller's own array; editing it leaves the
+        record unchanged.
         """
-        if self._x is None:
-            i, q = self._i, self._q
-            out = np.empty(i.shape, dtype=self.complex_dtype)
-            if i.ndim != 1 or i.shape[0] < _utils._THREADED_MIN_SAMPLES:
-                out.real = i
-                out.imag = q
-            else:
-                # Large record: thread chunks (see _utils._in_chunks), each
-                # in one interleaving pass when the Cython kernel is built.
-                # Same values either way.
-                parts = out.view(out.real.dtype)
-                kernel = (
-                    _iq_to_complex
-                    if i.flags.c_contiguous and q.flags.c_contiguous
-                    else None
-                )
+        i, q = self._pair()
+        out = np.empty(i.shape, dtype=self.complex_dtype)
+        if i.shape[0] < _utils._THREADED_MIN_SAMPLES:
+            out.real = i
+            out.imag = q
+        else:
+            # Large record: thread chunks (see _utils._in_chunks), each
+            # in one interleaving pass when the Cython kernel is built.
+            # Same values either way.
+            parts = out.view(out.real.dtype)
+            kernel = (
+                _iq_to_complex
+                if i.flags.c_contiguous and q.flags.c_contiguous
+                else None
+            )
 
-                def fill(a, b):
-                    if kernel is not None:
-                        kernel(i[a:b], q[a:b], parts[2 * a : 2 * b])
-                    else:
-                        out.real[a:b] = i[a:b]
-                        out.imag[a:b] = q[a:b]
+            def fill(a, b):
+                if kernel is not None:
+                    kernel(i[a:b], q[a:b], parts[2 * a : 2 * b])
+                else:
+                    out.real[a:b] = i[a:b]
+                    out.imag[a:b] = q[a:b]
 
-                _utils._in_chunks(i.shape[0], 1, fill)
-            out.flags.writeable = False
-            self._x = out
-        return self._x
+            _utils._in_chunks(i.shape[0], 1, fill)
+        return out
 
     # ---- scalar statistics --------------------------------------------
 
     def _sum_sq(self) -> float:
         # sum(I^2 + Q^2) in float64 without materialising float copies of I
-        # and Q: einsum casts block-wise inside its loop. Exact for 2k+1
-        # integers (|y| <= 65535, y^2 < 2^53) and ~7x faster than astype.
+        # and Q: einsum casts block-wise inside its loop, ~7x faster than
+        # astype.  Every square is exact (|y| <= 65535, y^2 < 2^53); the sum
+        # is exact while it stays below 2^53 (~1e6 full-scale 16-bit
+        # samples), beyond that rounded at ~1e-16 relative.
+        i, q = self._pair()
         return float(
-            np.einsum("i,i->", self._i, self._i, dtype=np.float64)
-            + np.einsum("i,i->", self._q, self._q, dtype=np.float64)
+            np.einsum("i,i->", i, i, dtype=np.float64)
+            + np.einsum("i,i->", q, q, dtype=np.float64)
         )
 
     @property
     def power(self) -> float:
-        """Average power of the complex signal."""
+        """
+        Mean of ``I**2 + Q**2`` over the record, in stored-value units.
+
+        The unit is the 2k+1 step of §5.3.6 (half an ADC step), squared:
+        uncalibrated, no receiver gain, and carrier, noise and DC together.
+        A data-quality level, not a physical power.  In the raw codes k
+        (y = 2k+1) each of I and Q contributes ``4*mean(k**2) + 4*mean(k)
+        + 1``, so it is not simply 4x a power computed on k.  NaN for an
+        empty record.
+        """
         if len(self) == 0:
             return float("nan")
         return self._sum_sq() / len(self)
 
     @property
     def power_db(self) -> float:
-        """Average power in dB."""
-        return 10.0 * np.log10(self.power + 1e-12)
+        """
+        ``power`` in dB re 1 (2k+1 unit)**2.
 
-    @property
-    def energy(self) -> float:
-        """Total energy (sum of |x|**2)."""
-        return self._sum_sq()
-
-    @property
-    def energy_db(self) -> float:
-        """Total energy in dB."""
-        return 10.0 * np.log10(self.energy + 1e-12)
-
-    @property
-    def peak_amplitude(self) -> float:
-        """Peak amplitude of the complex signal."""
-        # max(I^2 + Q^2) in 64k-sample chunks: small int64 temps instead of
-        # two full float64 copies. Values are exact integers.
-        peak = 0
-        for s in range(0, len(self), 65536):
-            i = self._i[s : s + 65536]
-            q = self._q[s : s + 65536]
-            r2 = np.multiply(i, i, dtype=np.int64)
-            r2 += np.multiply(q, q, dtype=np.int64)
-            peak = max(peak, int(r2.max()))
-        return float(np.sqrt(peak))
+        No floor is added.  Decoded data has power >= 2 (zero is not a 2k+1
+        value); a hand-built all-zero record gives -inf, an empty one NaN.
+        """
+        with np.errstate(divide="ignore"):
+            return float(10.0 * np.log10(self.power))
 
     @property
     def rms(self) -> float:
         """Root-mean-square amplitude."""
         return float(np.sqrt(self.power))
 
-    # ---- saturation detection -----------------------------------------
+    # ---- full-scale check --------------------------------------------
 
     @property
-    def is_saturated(self) -> bool:
+    def full_scale_fraction(self) -> float:
         """
-        Whether any I or Q sample is at the representable limit.
+        Fraction of complex samples where I or Q is at full scale.
 
-        A sample counts as saturated when its absolute value equals the
-        maximum representable value for the current ``sample_size`` after
-        the 2k+1 transform (§5.3.6).
+        Full scale is ``±(2**sample_size - 1)`` after the 2k+1 transform
+        (§5.3.6).  The outermost code is the overflow bin: it holds every
+        input from just below full scale upward, so a sample there may or
+        may not have been clipped, and the data cannot tell which.  Read the
+        ratio against what the bit depth and gain setting make normal, not
+        as a count of clipped samples:
 
-        Returns
-        -------
-        bool
-            True if at least one sample reaches the saturation threshold.
-
-        Warns
-        -----
-        UserWarning
-            For 1-bit samples, where saturation is undefined (every value
-            is inherently ±1).  Returns False.
-        """
-        threshold = _SATURATION_THRESHOLD[self.sample_size]
-        if self.sample_size == 1:
-            warnings.warn(
-                "Saturation is undefined for 1-bit samples "
-                "(all values are inherently ±1)",
-                stacklevel=2,
-            )
-            return False
-        if len(self) == 0:
-            return False
-        # min/max reductions: no abs() copy of the arrays
-        return bool(
-            self._i.max() >= threshold or self._i.min() <= -threshold
-            or self._q.max() >= threshold or self._q.min() <= -threshold
-        )
-
-    @property
-    def saturation_ratio(self) -> float:
-        """
-        Fraction of complex samples where I or Q is at the limit.
+        - 1-bit: every value is ±1, i.e. full scale, so the ratio would be
+          1.0 by construction and says nothing.  Warns and returns 0.0.
+        - 2-bit (codes ±1, ±3) and 4-bit: coarse quantizers use their outer
+          levels routinely, so a ratio above 0 is expected on any real
+          record.
+        - 8- and 16-bit: a ratio above 0 means the input reached full scale;
+          a large one points to a gain set too high.
 
         Returns
         -------
         float
-            Value between 0.0 (no saturation) and 1.0 (all saturated).
+            Between 0.0 and 1.0; NaN for an empty record (as ``power``).
 
         Warns
         -----
         UserWarning
-            For 1-bit samples, where saturation is undefined.  Returns 0.0.
+            For 1-bit samples (see above).  Returns 0.0.
         """
-        threshold = _SATURATION_THRESHOLD[self.sample_size]
+        threshold = _FULL_SCALE[self.sample_size]
         if self.sample_size == 1:
             warnings.warn(
-                "Saturation is undefined for 1-bit samples "
+                "Full-scale fraction is undefined for 1-bit samples "
                 "(all values are inherently ±1)",
                 stacklevel=2,
             )
             return 0.0
-        n = len(self)
+        i, q = self._pair()
+        n = len(i)
         if n == 0:
-            return 0.0
+            return float("nan")
         # Four 1-byte bool temps instead of two full-width abs() copies.
-        hit = self._i >= threshold
-        hit |= self._i <= -threshold
-        hit |= self._q >= threshold
-        hit |= self._q <= -threshold
+        hit = i >= threshold
+        hit |= i <= -threshold
+        hit |= q >= threshold
+        hit |= q <= -threshold
         return float(np.count_nonzero(hit) / n)
 
     # ---- time-domain helpers ------------------------------------------
@@ -673,7 +684,10 @@ class RecordData:
 
     @property
     def time_array(self) -> np.ndarray:
-        """Sample time offsets in seconds (requires ``sample_rate``)."""
+        """
+        Sample times in seconds from the first sample, i.e. from
+        ``Record.header.timetag`` (requires ``sample_rate``).
+        """
         return np.arange(len(self)) / self._require_sample_rate()
 
 

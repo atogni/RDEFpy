@@ -31,7 +31,7 @@ Record
 RecordHeader
     Parsed 176-byte RDEF record header (Table 5-1).
 RecordData
-    I/Q sample container with level and saturation checks.
+    I/Q sample container with level and full-scale checks.
 
 I/O Functions
 -------------

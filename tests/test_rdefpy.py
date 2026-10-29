@@ -600,25 +600,57 @@ def test_productfile_downconversion_arrays_are_header_only(monkeypatch):
 # =============================================================================
 
 
-def test_saturation_detected_at_the_bit_depth_limit():
+def test_full_scale_fraction_at_the_bit_depth_limit():
     d = RecordData(8, 4, np.array([255, 1, 1, 1], np.int16), np.ones(4, np.int16))
-    assert d.is_saturated is True
-    assert d.saturation_ratio == pytest.approx(0.25)
+    assert d.full_scale_fraction == pytest.approx(0.25)
 
 
-def test_saturation_is_undefined_for_one_bit():
+def test_full_scale_fraction_is_undefined_for_one_bit():
     d = RecordData(1, 2, np.array([1, -1], np.int8), np.array([1, -1], np.int8))
     with pytest.warns(UserWarning, match="undefined for 1-bit"):
-        assert d.is_saturated is False
-    with pytest.warns(UserWarning, match="undefined for 1-bit"):
-        assert d.saturation_ratio == 0.0
+        assert d.full_scale_fraction == 0.0
+
+
+def test_full_scale_fraction_of_an_empty_record_is_nan():
+    assert np.isnan(RecordData(8).full_scale_fraction)
+
+
+def test_i_without_q_is_an_error_not_a_zero_q():
+    d = RecordData(8, 2)
+    d.i_samples = np.array([1, 3], np.int16)
+    for name in ("power", "samples", "full_scale_fraction"):
+        with pytest.raises(ValueError, match="set both"):
+            getattr(d, name)
+
+
+def test_samples_must_be_1d():
+    two_d = np.ones((2, 3), np.int32)
+    with pytest.raises(ValueError, match="1-D"):
+        RecordData(16, 3, two_d, two_d)
+    d = RecordData(16, 3, np.ones(3, np.int32), np.ones(3, np.int32))
+    with pytest.raises(ValueError, match="1-D"):
+        d.i_samples = two_d
+
+
+def test_decode_refuses_a_partial_32_bit_word():
+    """§5.3.2: the data section is whole 32-bit words, for every sample size."""
+    from rdefpy.prd.reader import _decode_iq
+    for bits in (16, 8, 4, 2, 1):
+        with pytest.raises(ValueError, match="32-bit words"):
+            _decode_iq(bytes(6), bits)
 
 
 def test_power_and_rms_agree():
     d = RecordData(16, 4, np.full(4, 3, np.int32), np.full(4, 4, np.int32))
     assert d.power == pytest.approx(25.0)
     assert d.rms == pytest.approx(5.0)
-    assert d.energy == pytest.approx(100.0)
+    assert d.power_db == pytest.approx(10 * np.log10(25.0))
+
+
+def test_power_db_has_no_floor():
+    zeros = np.zeros(2, np.int16)
+    assert RecordData(8, 2, zeros, zeros).power_db == -np.inf
+    assert np.isnan(RecordData(8).power_db)
 
 
 def test_samples_is_exactly_i_plus_jq():
@@ -718,8 +750,8 @@ def test_record_data_summary_makes_no_pass_over_the_samples(monkeypatch):
     def boom(self):
         raise AssertionError("str(RecordData) touched the samples")
 
-    for name in ("samples", "power", "power_db", "energy", "energy_db", "peak_amplitude",
-                 "rms", "is_saturated", "saturation_ratio", "time_array"):
+    for name in ("samples", "power", "power_db",
+                 "rms", "full_scale_fraction", "time_array"):
         monkeypatch.setattr(RecordData, name, property(boom))
     d = RecordData(16, 4, np.ones(4, np.int32), np.ones(4, np.int32))
     rows = [ln.split(":")[0].strip() for ln in str(d).splitlines()[1:]]
@@ -917,15 +949,15 @@ def test_threaded_decode_works_in_a_forked_child(monkeypatch):
     assert os.waitstatus_to_exitcode(status) == 0
 
 
-def test_samples_are_cached_and_read_only():
-    """One complex build per record, shared by every caller, so nobody may
-    edit it in place; assigning I or Q invalidates the cache."""
+def test_samples_always_match_i_and_q():
+    """Built on every access: in-place I/Q edits show up, and editing the
+    returned array leaves the record unchanged."""
     pf = read_product(PRD_16)
+    pf.load()
     d = pf.records[0].data
     x = d.samples
-    assert d.samples is x
-    with pytest.raises(ValueError, match="read-only"):
-        x[0] = 0
-    d.i_samples = d.i_samples.copy()
-    assert d.samples is not x
-    assert np.array_equal(d.samples, x)
+    x[0] = 0
+    assert d.samples[0] != 0
+    d.i_samples[0] = 5
+    d.q_samples[0] = 7
+    assert d.samples[0] == 5 + 7j
