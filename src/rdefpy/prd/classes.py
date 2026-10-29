@@ -32,9 +32,9 @@ import copy
 import operator
 import warnings
 import weakref
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
-from collections.abc import Iterator
 from typing import Any, TextIO, overload
 
 import numpy as np
@@ -79,8 +79,6 @@ _HEADER_FIELDS = (
     "empty_fields_internal_agency_use",
 )
 _HEADER_FIELD_SET = frozenset(_HEADER_FIELDS)
-
-_HEADER_SIZE_BYTES = 176
 
 # Maximum absolute sample value per bit-depth after the 2k+1 transform (§5.3.6).
 _SATURATION_THRESHOLD: dict[int, int] = {
