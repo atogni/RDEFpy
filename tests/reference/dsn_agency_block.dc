@@ -1,0 +1,10 @@
+# dsn_agency_block.prd: downconversion (CCSDS 506.1-B-1 sec. 5.2.6) per record, from rdef_spec
+# t0 = TIME TAG SECOND OF DAY (Table 5-1, sec. 5.2.6.2; DSN 0222 Table 3-1, sec. 3.4);
+#   first sample at t - t0 = picoseconds*1e-12
+# f_first: total f_DC at the record's first sample [Hz]
+# f_mean:  total f_DC averaged over [first sample, first sample + 1 s) [Hz]
+# phase_first: variable-part phase at the first sample, Phi + c0 + ... [turns]
+# record f_first f_mean phase_first
+1 8400001234.5 8400001234.374023 100.250061725
+2 8400001234.24707 8400001234.118164 1334.6240851498535
+3 8400001233.988281 8400001233.856445 2568.742249199414

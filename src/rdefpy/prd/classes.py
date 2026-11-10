@@ -1,0 +1,2219 @@
+# Copyright (c) 2026 Morehead State University
+# Author: Andrea Togni
+# SPDX-License-Identifier: MIT
+
+"""
+Data model classes for RDEF product files (.prd).
+
+Implements the binary record structure defined in CCSDS 506.1-B-1
+(June 2013), "Delta-DOR Raw Data Exchange Format", §5.
+
+Classes
+-------
+RecordHeader
+    Parsed metadata for a single RDEF record (§5.2, Table 5-1).
+RecordData
+    I/Q sample container (§5.3).
+Record
+    Single RDEF record combining header and data (§5.1).
+ProductFile
+    Top-level container for complete RDEF product files.
+
+Notes
+-----
+These are containers, not estimators.  Spectra, carrier tracking, and
+simulation belong to the caller; this module's job is to hand them
+correct samples with correct time tags.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import numbers
+import operator
+import warnings
+import weakref
+from collections.abc import Iterator
+from datetime import datetime
+from pathlib import Path
+from typing import Any, TextIO, overload
+
+import numpy as np
+
+from rdefpy import _utils
+from rdefpy._utils import _Progress, _to_datetime64
+from rdefpy.prd import _display
+from rdefpy.prd._binary import _FIELDS as _HEADER_FIELDS
+from rdefpy.prd._binary import _user_stacklevel
+
+# Cython I/Q -> complex interleave (unpack_cyth.pyx) for thread chunks of
+# large records; NumPy when not built.
+try:
+    from rdefpy.prd.unpack_cyth import iq_to_complex as _iq_to_complex
+except ImportError:
+    _iq_to_complex = None
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+# _HEADER_FIELDS (imported): Table 5-1 header fields, in file order
+_HEADER_FIELD_SET = frozenset(_HEADER_FIELDS)
+
+# Maximum absolute sample value per bit-depth after the 2k+1 transform (§5.3.6).
+_FULL_SCALE: dict[int, int] = {
+    1: 1,
+    2: 3,
+    4: 15,
+    8: 255,
+    16: 65535,
+}
+
+
+# =============================================================================
+# Downconversion reconstruction (§5.2.6) -- the one implementation
+# =============================================================================
+
+_PHASE_FIELDS = (
+    "channel_accumulated_phase",
+    "channel_phase_polynomial_coefficient_0",
+    "channel_phase_polynomial_coefficient_1",
+    "channel_phase_polynomial_coefficient_2",
+    "channel_phase_polynomial_coefficient_3",
+)
+
+
+def _fixed_downconv_hz(header: RecordHeader) -> float:
+    """
+    Fixed downconversion ``rf_to_if + if_to_channel`` in Hz (§5.2.6).
+
+    Raises ``ValueError`` when either field is unset: a 0 Hz local
+    oscillator is never a valid default, so a half-built header must not
+    silently yield a frequency before downconversion off by the whole LO.
+    """
+    rf, ifc = header.rf_to_if_downconv, header.if_to_channel_downconv
+    if rf is None or ifc is None:
+        raise ValueError(
+            "rf_to_if_downconv and if_to_channel_downconv must both be set to "
+            f"reconstruct the downconversion (§5.2.6); got {rf!r} and {ifc!r}"
+        )
+    return float(rf) + float(ifc)
+
+
+def _phase_terms(header: RecordHeader) -> tuple[float, ...]:
+    """
+    ``(Phi, c0, c1, c2, c3)`` from the header (§5.2.6).
+
+    Unset values count as 0: a header built by hand without a variable
+    downconversion part has none, which is what 0 means.
+    """
+    return tuple(float(getattr(header, f) or 0.0) for f in _PHASE_FIELDS)
+
+
+# Origin t0 of the phase polynomial (§5.2.6.2, Table 5-1): TIME TAG SECOND
+# OF DAY + t0_offset, a read-time setting (read_product / read_headers).
+
+
+def _check_t0_offset(t0_offset) -> float:
+    """*t0_offset* as a float if it is a finite real number, else ``ValueError``."""
+    if isinstance(t0_offset, bool | np.bool_) or not isinstance(t0_offset, numbers.Real):
+        raise ValueError(f"t0_offset must be a finite number of seconds, got {t0_offset!r}")
+    value = float(t0_offset)
+    if not math.isfinite(value):
+        raise ValueError(f"t0_offset must be a finite number of seconds, got {t0_offset!r}")
+    return value
+
+
+def _origin_offset(header: RecordHeader, t0_offset: float = 0.0) -> float:
+    """
+    Time in s of the record's first sample from the polynomial origin
+    t0 = TIME TAG SECOND OF DAY + *t0_offset*: ``picoseconds * 1e-12 -
+    t0_offset``.  Offset 0 is the spec reading (§5.2.6.2, Table 5-1).
+    Unset picoseconds count as 0, as in ``RecordHeader.timetag``.
+    """
+    return float(header.time_tag_picoseconds_of_the_second or 0.0) * 1e-12 - t0_offset
+
+
+def _downconv_hz(header: RecordHeader, tau):
+    """
+    Total downconversion frequency in Hz at *tau* seconds from the
+    polynomial origin t0 (see ``_origin_offset``: sample k of the record is
+    at ``tau = _origin_offset(header, t0_offset) + k/fs``).
+
+    ``f_DC = (rf_to_if + if_to_channel) + (c1 + 2*c2*tau + 3*c3*tau**2)``
+    (§5.2.6).  *tau* is a float or an array.  Every downconversion
+    frequency in the package -- per sample, per record, the
+    ``select`` / ``read_product`` band filters, ``extract_carrier`` --
+    goes through here.  NaN coefficients give NaN.
+    """
+    _, _, c1, c2, c3 = _phase_terms(header)
+    return _fixed_downconv_hz(header) + (c1 + 2.0 * c2 * tau + 3.0 * c3 * tau**2)
+
+
+def _filter_downconv_hz(header: RecordHeader, t0_offset: float) -> float:
+    """
+    Frequency the ``min/max_downconv_hz`` / ``band`` filters compare: the
+    total at the record's first sample, or the fixed part alone when c1,
+    c2 and c3 are all NaN (DSN 0222 Millisecond Predict records, whose
+    variable part is not in the file; the band is set by the fixed part).
+    """
+    if _all_nan_c123(header):
+        return _fixed_downconv_hz(header)
+    return _downconv_hz(header, _origin_offset(header, t0_offset))
+
+
+def _all_nan_c123(header: RecordHeader) -> bool:
+    """c1, c2 and c3 all NaN: the DSN 0222 Millisecond Predict case."""
+    vals = (getattr(header, f"channel_phase_polynomial_coefficient_{k}") for k in (1, 2, 3))
+    return all(v is not None and v != v for v in vals)  # NaN != NaN
+
+
+def _mean_downconv_hz(header: RecordHeader, t0_offset: float = 0.0) -> float:
+    """
+    Time average in Hz of ``_downconv_hz`` over the record's span, from its
+    first sample at ``tau = a`` to ``b = a + 1`` s (a record is one second
+    of samples, §5.1.1), ``a = _origin_offset(header, t0_offset)``.
+
+    ``F + c1 + c2*(a + b) + c3*(a**2 + a*b + b**2)``: the variable phase
+    advance over the record per second, not the value at the midpoint
+    (they differ when c3 != 0).
+    """
+    _, _, c1, c2, c3 = _phase_terms(header)
+    a = _origin_offset(header, t0_offset)
+    b = a + 1.0
+    return _fixed_downconv_hz(header) + c1 + c2 * (a + b) + c3 * (a * a + a * b + b * b)
+
+
+def _downconv_phase(header: RecordHeader, tau):
+    """
+    Downconversion phase in turns at *tau* seconds from the polynomial
+    origin t0 (see ``_downconv_hz``).
+
+    ``phi(t) = Phi + c0 + c1*t + c2*t**2 + c3*t**3`` (§5.2.6.2): the
+    VARIABLE part only.  ``Phi`` (CHANNEL ACCUMULATED PHASE) holds the whole
+    turns of the channel variable downconverter (Table 5-1); the fixed
+    part's phase needs the experiment epoch t_b, "generally unknown"
+    (§5.2.6.1), so it is not in the file.  *t* is a float or an array.
+    Summed in float64: a large ``Phi`` costs precision in the fraction
+    (up to about 1e-6 turns at Phi = 1e10).
+    """
+    phi, c0, c1, c2, c3 = _phase_terms(header)
+    return phi + c0 + c1 * tau + c2 * tau**2 + c3 * tau**3
+
+
+def _header_sample_rate(header: RecordHeader) -> float:
+    """Header ``sample_rate`` as float; raises if unset or non-positive."""
+    if header.sample_rate is None:
+        raise ValueError("sample_rate is required for downconversion computation")
+    fs = float(header.sample_rate)
+    if fs <= 0:
+        raise ValueError(f"Invalid sample rate: {fs} Hz")
+    return fs
+
+
+def _sample_times(header: RecordHeader, n: int) -> np.ndarray:
+    """
+    Polynomial times ``tau = t - t0`` in s of the *n* samples:
+    ``_origin_offset(header, header._t0_offset) + k/fs`` (see ``_origin_offset``).
+    """
+    off = _origin_offset(header, header._t0_offset)
+    return off + np.arange(n, dtype=np.float64) / _header_sample_rate(header)
+
+
+def _record_epoch(header: RecordHeader) -> np.datetime64 | None:
+    """``header.timetag``, or ``None`` when the time-tag fields are unusable."""
+    try:
+        return header.timetag
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _in_window(x: float, lo: float | None, hi: float | None) -> bool:
+    """``lo <= x <= hi``, either bound optional; NaN is never inside."""
+    return (lo is None or x >= lo) and (hi is None or x <= hi)
+
+
+def _same_key(v):
+    """*v* for equality tests, with every NaN equal to every other (NaN != NaN)."""
+    return "nan" if v != v else v
+
+
+# Header fields that must be the same in every record of a product file.
+# One station, scan and channel per file is the spec (§3.2.2.2-4, §5.1.3);
+# sample size/rate, agency flag and version are held fixed by this package,
+# not by the spec.  Checked when a file is read and when two files are
+# concatenated.
+_FILE_CONSTANT_FIELDS = (
+    "station_id",
+    "spacecraft_id",
+    "agency_flag",
+    "record_version_id",
+    "sample_size",
+    "sample_rate",
+    "rf_to_if_downconv",
+    "if_to_channel_downconv",
+)
+
+
+# =============================================================================
+# Internal-agency block (header bytes 132-171)
+# =============================================================================
+
+#: DSN OLR layout of the 40-byte internal-agency block, little-endian
+#: (DSN 820-013 0222-Science Rev. A, Table 3-1 / Figure 3-4).
+DSN_AGENCY_DTYPE = np.dtype([
+    ("predict_pass_number", "<u2"),
+    ("uplink_band", "u1"),
+    ("downlink_band", "u1"),
+    ("track_mode", "u1"),
+    ("uplink_dss_id", "u1"),
+    ("olr_id", "u1"),
+    ("olr_software_version", "u1"),
+    ("channel_power_calibration_factor", "<f4"),
+    ("total_frequency_offset", "<f8"),
+    ("channel_number", "u1"),
+    ("spare", "V19"),
+])
+_RAW_AGENCY_DTYPE = np.dtype([("raw", "V40")])
+# Upper limit of TIME TAG PICOSECONDS OF THE SECOND in DSN 0222 Table 3-1.
+_PS_0222_MAX = 100_000.0
+_AGENCY_SIZE = 40
+
+
+def _check_agency_layout(layout):
+    """*layout* if valid: ``"auto"``, ``"dsn"`` or a 40-byte ``np.dtype``."""
+    if isinstance(layout, str) and layout in ("auto", "dsn"):
+        return layout
+    valid = "agency_layout must be \"auto\", \"dsn\" or a 40-byte dtype"
+    try:
+        dt = np.dtype(layout)
+    except (TypeError, ValueError):
+        raise ValueError(f"{valid}, got {layout!r}") from None
+    if dt.itemsize != _AGENCY_SIZE:
+        raise ValueError(
+            f"{valid}: {layout!r} is {dt.itemsize} bytes; the internal-agency "
+            f"block is {_AGENCY_SIZE} bytes (Table 5-1)"
+        )
+    if dt.hasobject:  # np.frombuffer cannot build Python objects from bytes
+        raise ValueError(f"{valid} without object fields, got {layout!r}")
+    return dt
+
+
+def _agency_dtype(layout, agency_flags) -> np.dtype:
+    """
+    The dtype *layout* (checked) stands for; ``"auto"`` decides from the
+    *agency_flags* of the file: 3 (NASA) -> ``DSN_AGENCY_DTYPE``, anything
+    else -> one raw 40-byte field ``"raw"``.  Flags that differ between
+    records give the raw field too, with a ``RuntimeWarning``.
+    """
+    if not (isinstance(layout, str) and layout == "auto"):
+        layout = _check_agency_layout(layout)
+        return DSN_AGENCY_DTYPE if isinstance(layout, str) else layout
+    flags = {_same_key(f) for f in agency_flags}
+    if len(flags) > 1:
+        warnings.warn(
+            f"agency_flag differs across records ({sorted(flags, key=repr)}): raw bytes "
+            "returned; read the file again with agency_layout=... to decode the "
+            "internal-agency block",
+            RuntimeWarning,
+            stacklevel=_user_stacklevel(),
+        )
+    return DSN_AGENCY_DTYPE if flags == {3} else _RAW_AGENCY_DTYPE
+
+
+def _agency_bytes(header: RecordHeader) -> bytes:
+    """
+    The header's 40-byte internal-agency block (unset: 40 zero bytes, as
+    ``write_product`` writes it); ``ValueError`` if not 40 bytes.
+    """
+    b = header.empty_fields_internal_agency_use
+    b = bytes(b) if b is not None else bytes(_AGENCY_SIZE)
+    if len(b) != _AGENCY_SIZE:
+        raise ValueError(
+            f"empty_fields_internal_agency_use holds {len(b)} bytes, "
+            f"expected {_AGENCY_SIZE} (Table 5-1)"
+        )
+    return b
+
+
+# =============================================================================
+# RecordHeader
+# =============================================================================
+
+
+class RecordHeader:
+    """
+    Parsed RDEF record header (CCSDS 506.1-B-1 Table 5-1).
+
+    Attributes
+    ----------
+    record_length : int
+        Total record length in bytes (header + data).
+    record_version_id : int
+        RDEF format version identifier.
+    station_id : int
+        Ground station identifier.
+    spacecraft_id : int
+        Spacecraft identifier.
+    sample_size : int
+        Bits per I/Q component (1, 2, 4, 8, or 16).
+    sample_rate : int
+        Complex samples per second.
+    validity_flag : int
+        0 = no error, or no check performed; a positive value is an
+        implementation-dependent error code (Table 5-1).
+    agency_flag : int
+        0=unused, 1=ESA, 2=JAXA, 3=NASA.
+    rf_to_if_downconv : float
+        RF-to-IF downconversion frequency (Hz).
+    if_to_channel_downconv : float
+        IF-to-channel downconversion frequency (Hz).
+    time_tag_year : int
+        Time tag year.
+    time_tag_doy : int
+        Time tag day of year (1-366).
+    time_tag_second_of_day : int
+        Time tag second of day (0-86400; 86400 is a leap second).
+    time_tag_picoseconds_of_the_second : float
+        Picoseconds of the second of the first sample in the record
+        (Table 5-1); 0 if unknown.
+    channel_accumulated_phase : float
+        Integer part (whole turns) of the accumulated downconverter phase at
+        t0 (§5.2.6.2), the polynomial origin (TIME TAG SECOND OF DAY).
+    channel_phase_polynomial_coefficient_0 : float
+        Phase polynomial coefficient c0 in turns (§5.2.6).
+    channel_phase_polynomial_coefficient_1 : float
+        Phase polynomial coefficient c1 in turns/s (§5.2.6).
+    channel_phase_polynomial_coefficient_2 : float
+        Phase polynomial coefficient c2 in turns/s**2 (§5.2.6).
+    channel_phase_polynomial_coefficient_3 : float
+        Phase polynomial coefficient c3 in turns/s**3 (§5.2.6).
+    empty_fields_future_extension : bytes
+        Reserved 36 bytes for future extensions.
+    empty_fields_internal_agency_use : bytes
+        40 bytes for internal agency use; decode them with
+        ``agency_fields()`` (layout ``DSN_AGENCY_DTYPE`` for DSN OLR files,
+        see ``ProductFile.agency_layout``).
+    """
+
+    # The Table 5-1 fields, then two read-time settings that are not header
+    # fields: the polynomial origin offset and the agency-block layout,
+    # stamped by read_product / read_headers (``t0_offset`` /
+    # ``agency_layout``); a standalone header uses 0.0 and "auto".
+    __slots__ = (*_HEADER_FIELDS, "_t0_offset", "_agency_layout")
+
+    # Declared for type checkers and IDEs (the slots above come from
+    # _HEADER_FIELDS at runtime).  Every field is None until set.
+    record_length: int | None
+    record_version_id: int | None
+    station_id: int | None
+    spacecraft_id: int | None
+    sample_size: int | None
+    sample_rate: int | None
+    validity_flag: int | None
+    agency_flag: int | None
+    rf_to_if_downconv: float | None
+    if_to_channel_downconv: float | None
+    time_tag_year: int | None
+    time_tag_doy: int | None
+    time_tag_second_of_day: int | None
+    time_tag_picoseconds_of_the_second: float | None
+    channel_accumulated_phase: float | None
+    channel_phase_polynomial_coefficient_0: float | None
+    channel_phase_polynomial_coefficient_1: float | None
+    channel_phase_polynomial_coefficient_2: float | None
+    channel_phase_polynomial_coefficient_3: float | None
+    empty_fields_future_extension: bytes | None
+    empty_fields_internal_agency_use: bytes | None
+
+    def __init__(self, info: dict[str, Any] | None = None):
+        """
+        Initialise header fields.
+
+        Parameters
+        ----------
+        info : dict or None
+            Mapping of field names to values.  Unknown keys raise
+            ``KeyError``.  All fields default to ``None``.
+
+        Notes
+        -----
+        Headers are mutable: fields can be modified by direct assignment or
+        via ``Record.correct_header()``.
+        """
+        if info is None:
+            info = {}
+        elif not _HEADER_FIELD_SET.issuperset(info):
+            key = next(k for k in info if k not in _HEADER_FIELD_SET)
+            raise KeyError(f"Unknown header field: {key}")
+        # One pass over the slots: the reader builds one header per record.
+        get = info.get
+        for field in _HEADER_FIELDS:
+            setattr(self, field, get(field))
+        self._t0_offset = 0.0
+        self._agency_layout = "auto"
+
+    def __deepcopy__(self, memo: dict) -> RecordHeader:
+        """Deep-copy every header field into a new ``RecordHeader``."""
+        info = {f: copy.deepcopy(getattr(self, f), memo) for f in _HEADER_FIELDS}
+        new = RecordHeader(info)
+        new._t0_offset, new._agency_layout = self._t0_offset, self._agency_layout
+        return new
+
+    def __repr__(self) -> str:
+        return _display.header_repr(self)
+
+    def __str__(self) -> str:
+        return _display.header_str(self)
+
+    @property
+    def timetag(self) -> np.datetime64:
+        """
+        Time of the record's first sample as a ``numpy.datetime64[ns]``.
+
+        Combines the header time-tag fields (year, day-of-year,
+        second-of-day, and picoseconds-of-the-second) into a single
+        ``numpy.datetime64`` value with nanosecond resolution.
+        Picoseconds are rounded to the nearest nanosecond (ties to even,
+        as Python ``round``): the field is a
+        float64 (Table 5-1), and a value one ulp below a whole nanosecond
+        must not lose that nanosecond.
+
+        The time scale is station time, an approximation to UTC (§5.2.5).
+        NumPy has no leap seconds: a leap-second record (SECOND OF DAY
+        86400) gets the same tag as SECOND OF DAY 0 of the next day.  The
+        header fields themselves keep the two apart.  ``datetime64[ns]``
+        spans 1678-2262 and would wrap silently outside it, so a year
+        outside 1678-2261, a day of year outside 1-366 or a second of day
+        outside 0-86400 raises ``ValueError``.  Day 366 of a non-leap year
+        is not checked: it gives 1 January of the next year.
+
+        Returns
+        -------
+        numpy.datetime64
+            Station-time timestamp with ``datetime64[ns]`` precision.
+
+        Raises
+        ------
+        ValueError
+            Year, day of year or second of day out of range.
+        TypeError
+            Year, day of year or second of day not set (None).
+        """
+        y, d, s = int(self.time_tag_year), int(self.time_tag_doy), int(self.time_tag_second_of_day)
+        if not (1678 <= y <= 2261 and 1 <= d <= 366 and 0 <= s <= 86400):
+            raise ValueError(f"time tag year {y}, day {d}, second {s}: outside 1678-2261, 1-366, 0-86400")
+        base = np.datetime64(f"{y:04d}-01-01", "ns")
+        base += np.timedelta64(d - 1, "D")
+        base += np.timedelta64(s, "s")
+        pico = self.time_tag_picoseconds_of_the_second
+        if pico:
+            base += np.timedelta64(round(float(pico) / 1000), "ns")
+        return base
+
+    def agency_fields(self) -> np.void:
+        """
+        The 40-byte internal-agency block decoded as one structured row.
+
+        Layout from the setting of the file the header was read into
+        (``ProductFile.agency_layout``), ``"auto"`` for a standalone
+        header: agency_flag 3 (NASA) gives the DSN OLR fields of
+        ``DSN_AGENCY_DTYPE`` (DSN 820-013 0222-Science Rev. A, Table 3-1),
+        any other agency_flag one raw field ``"raw"`` (``V40``).  Values are
+        raw: no code mapping, no unit conversion.  Read-only.
+
+        Raises
+        ------
+        ValueError
+            If ``empty_fields_internal_agency_use`` is not 40 bytes.
+        """
+        dt = _agency_dtype(self._agency_layout, [self.agency_flag])
+        return np.frombuffer(_agency_bytes(self), dtype=dt)[0]
+
+
+# =============================================================================
+# RecordData
+# =============================================================================
+
+
+def _check_complex_out(out, n: int) -> None:
+    """Raise unless *out* can take *n* complex samples in place.
+
+    The decode kernels run without bounds checks: a wrong length, stride or
+    dtype must be stopped here, not written through.
+    """
+    if not isinstance(out, np.ndarray):
+        raise ValueError(f"out must be a numpy array, got {type(out).__name__}")
+    if out.dtype not in (np.dtype(np.complex64), np.dtype(np.complex128)):
+        raise ValueError(f"out must be complex64 or complex128, got {out.dtype}")
+    if out.shape != (n,):
+        raise ValueError(f"out has shape {out.shape}, need ({n},)")
+    f = out.flags
+    if not (f.c_contiguous and f.aligned and f.writeable):
+        raise ValueError("out must be C-contiguous, aligned and writeable")
+
+
+class RecordData:
+    """
+    I/Q sample container for one RDEF record.
+
+    Each RDEF record holds exactly one second of data at a fixed sample
+    rate (CCSDS 506.1-B-1 §5.1).  Sample values use the ``2k+1``
+    bias-corrected representation defined in §5.3.6 and are stored as
+    integers -- exactly the values on disk, never scaled or centred.
+
+    The scalar properties below are data-quality checks (level, dynamic
+    range, clipping), not signal processing.  For spectra and carrier
+    tracking, hand ``samples`` to your estimator.
+
+    Parameters
+    ----------
+    sample_size : int
+        Bits per I/Q component (1, 2, 4, 8, or 16) per Table 5-1.
+    sample_rate : int, optional
+        Complex samples per second.  Required by ``duration_s`` and
+        ``time_array``.
+    i_samples, q_samples : np.ndarray, optional
+        In-phase / quadrature arrays.  Must be both provided or both
+        omitted.
+    complex_dtype : type or np.dtype
+        Precision of ``samples`` (complex64 or complex128).
+
+    Attributes
+    ----------
+    dtype : numpy dtype
+        Storage type: int8 for 1/2/4-bit, int16 for 8-bit, int32 for
+        16-bit (the smallest type holding the 2k+1 values exactly).
+    """
+
+    __slots__ = (
+        "__weakref__", "_i", "_q",
+        "complex_dtype", "dtype", "sample_rate", "sample_size",
+    )
+
+    def __init__(
+        self,
+        sample_size: int,
+        sample_rate: int | None = None,
+        i_samples: np.ndarray | None = None,
+        q_samples: np.ndarray | None = None,
+        *,
+        complex_dtype: type | np.dtype = np.complex128,
+    ):
+        self.sample_size = int(sample_size)
+        if self.sample_size not in (1, 2, 4, 8, 16):
+            raise ValueError(
+                f"sample_size must be one of (1, 2, 4, 8, 16) "
+                f"(Table 5-1, CCSDS 506.1-B-1), got {self.sample_size}"
+            )
+        self.sample_rate = int(sample_rate) if sample_rate is not None else None
+
+        cdt = np.dtype(complex_dtype)
+        if cdt not in (np.dtype(np.complex64), np.dtype(np.complex128)):
+            raise ValueError(
+                f"complex_dtype must be np.complex64 or np.complex128, got {cdt}"
+            )
+        # Precision of the materialised complex samples. complex64 halves the
+        # memory bandwidth for high-rate (e.g. 20 MHz) processing; complex128
+        # (default) and complex64 are both exact, since the 2k+1 values (§5.3.6)
+        # are small integers that fit losslessly in float32.
+        self.complex_dtype = cdt
+
+        # Smallest integer type that holds 2k+1 exactly (§5.3.6 doubles the
+        # raw range): 16-bit -> +-65535 needs int32, 8-bit -> +-255 needs
+        # int16, 4/2/1-bit -> +-15/+-3/+-1 fit int8.
+        if self.sample_size == 16:
+            self.dtype = np.int32
+        elif self.sample_size == 8:
+            self.dtype = np.int16
+        else:
+            self.dtype = np.int8
+
+        if (i_samples is None) != (q_samples is None):
+            raise ValueError(
+                "i_samples and q_samples must be both provided or both None"
+            )
+        if i_samples is None:
+            self._i = np.empty(0, dtype=self.dtype)
+            self._q = np.empty(0, dtype=self.dtype)
+            return
+
+        i_arr = self._as_storage(i_samples)
+        q_arr = self._as_storage(q_samples)
+        if i_arr.shape != q_arr.shape:
+            raise ValueError("i_samples and q_samples must have the same shape")
+        self._i = i_arr
+        self._q = q_arr
+
+    # ---- basic --------------------------------------------------------
+
+    def __len__(self) -> int:
+        """Return number of complex sample pairs."""
+        return self._pair()[0].shape[0]  # raises if only Q (or only I) is set
+
+    def __repr__(self) -> str:
+        return _display.data_repr(self)
+
+    def __str__(self) -> str:
+        return _display.data_str(self)
+
+    def _require_sample_rate(self) -> int:
+        """Raise if sample_rate is not set; return it otherwise."""
+        if self.sample_rate is None or self.sample_rate <= 0:
+            raise ValueError(
+                "sample_rate is required (a positive integer) for this "
+                f"operation, got {self.sample_rate!r}. Set it via "
+                "RecordData(..., sample_rate=fs) or rd.sample_rate = fs."
+            )
+        return self.sample_rate
+
+    def _as_storage(self, value) -> np.ndarray:
+        """
+        *value* as ``self.dtype``; raises if the cast would change a value.
+
+        Same-dtype input (the reader's) passes through uncopied and
+        unchecked.  Anything else is cast and compared, so a wrap (300 ->
+        44 in int8) or a truncation (2.7 -> 2) is an error, not a silent
+        change to the samples.
+        """
+        arr = np.asarray(value)
+        if arr.ndim != 1:
+            raise ValueError(f"samples must be 1-D, got shape {arr.shape}")
+        if arr.dtype == self.dtype:
+            return arr
+        with np.errstate(invalid="ignore"):  # NaN/inf: caught just below
+            out = arr.astype(self.dtype)
+        if not np.array_equal(out, arr):
+            raise ValueError(
+                f"samples do not fit {np.dtype(self.dtype)} exactly "
+                f"(sample_size={self.sample_size}): non-integer or out of "
+                "range values; quantize to 2k+1 integers first (§5.3.6)"
+            )
+        return out
+
+    def _pair(self) -> tuple[np.ndarray, np.ndarray]:
+        """``(I, Q)``; raises if only one of them has been set."""
+        if self._i.shape != self._q.shape:
+            raise ValueError(
+                f"I has {self._i.size} samples and Q {self._q.size}: "
+                "set both i_samples and q_samples"
+            )
+        return self._i, self._q
+
+    # ---- I/Q access ---------------------------------------------------
+
+    @property
+    def i_samples(self) -> np.ndarray:
+        """In-phase samples."""
+        return self._i
+
+    @i_samples.setter
+    def i_samples(self, value: np.ndarray) -> None:
+        arr = self._as_storage(value)
+        if self._q.size != 0 and arr.shape != self._q.shape:
+            raise ValueError("New I array shape does not match existing Q")
+        self._i = arr
+
+    @property
+    def q_samples(self) -> np.ndarray:
+        """Quadrature samples."""
+        return self._q
+
+    @q_samples.setter
+    def q_samples(self, value: np.ndarray) -> None:
+        arr = self._as_storage(value)
+        if self._i.size != 0 and arr.shape != self._i.shape:
+            raise ValueError("New Q array shape does not match existing I")
+        self._q = arr
+
+    @property
+    def samples(self) -> np.ndarray:
+        """Complex-valued signal ``I + jQ`` at ``self.complex_dtype``.
+
+        Defaults to complex128; complex64 when the record was decoded
+        single-precision (``read_product(..., dtype=np.complex64)``).  Built
+        directly at the target precision (no complex128 intermediate), and
+        lossless either way -- the 2k+1 values are exact integers in float32.
+
+        These are the recorded samples, unmodified.  No mean removal, no
+        window, no scaling: on an open-loop recording the carrier can sit in
+        the DC bin, where "harmless" DC removal would delete the signal.
+
+        Built anew on every access, from the current I and Q, so it always
+        matches them, in-place edits included.  The cost is paid each time:
+        take ``x = rec.data.samples`` once and reuse ``x``.  The result is
+        the caller's own array; editing it leaves the record unchanged.
+        ``Record.read_samples`` gives the same values faster for a record on
+        disk, and can refill one array per record.
+        """
+        return self._fill_complex(np.empty(len(self._i), dtype=self.complex_dtype))
+
+    def _fill_complex(self, out: np.ndarray) -> np.ndarray:
+        """Write ``I + jQ`` into *out* (complex, same length) and return it."""
+        i, q = self._pair()
+        if i.shape[0] < _utils._THREADED_MIN_SAMPLES:
+            out.real = i
+            out.imag = q
+        else:
+            # Large record: thread chunks (see _utils._in_chunks), each
+            # in one interleaving pass when the Cython kernel is built.
+            # Same values either way.
+            parts = out.view(out.real.dtype)
+            kernel = (
+                _iq_to_complex
+                if i.flags.c_contiguous and q.flags.c_contiguous
+                else None
+            )
+
+            def fill(a, b):
+                if kernel is not None:
+                    kernel(i[a:b], q[a:b], parts[2 * a : 2 * b])
+                else:
+                    out.real[a:b] = i[a:b]
+                    out.imag[a:b] = q[a:b]
+
+            _utils._in_chunks(i.shape[0], 1, fill)
+        return out
+
+    # ---- scalar statistics --------------------------------------------
+
+    def _sum_sq(self) -> float:
+        # sum(I^2 + Q^2) in float64 without materialising float copies of I
+        # and Q: einsum casts block-wise inside its loop, ~7x faster than
+        # astype.  Every square is exact (|y| <= 65535, y^2 < 2^53); the sum
+        # is exact while it stays below 2^53 (~1e6 full-scale 16-bit
+        # samples), beyond that rounded at ~1e-16 relative.
+        i, q = self._pair()
+        return float(
+            np.einsum("i,i->", i, i, dtype=np.float64)
+            + np.einsum("i,i->", q, q, dtype=np.float64)
+        )
+
+    @property
+    def power(self) -> float:
+        """
+        Mean of ``I**2 + Q**2`` over the record, in stored-value units.
+
+        The unit is the 2k+1 step of §5.3.6 (half an ADC step), squared:
+        uncalibrated, no receiver gain, and carrier, noise and DC together.
+        A data-quality level, not a physical power.  In the raw codes k
+        (y = 2k+1) each of I and Q contributes ``4*mean(k**2) + 4*mean(k)
+        + 1``, so it is not simply 4x a power computed on k.  NaN for an
+        empty record.
+        """
+        n = len(self._pair()[0])  # raises if only Q (or only I) is set
+        if n == 0:
+            return float("nan")
+        return self._sum_sq() / n
+
+    @property
+    def power_db(self) -> float:
+        """
+        ``power`` in dB re 1 (2k+1 unit)**2.
+
+        No floor is added.  Decoded data has power >= 2 (zero is not a 2k+1
+        value); a hand-built all-zero record gives -inf, an empty one NaN.
+        """
+        with np.errstate(divide="ignore"):
+            return float(10.0 * np.log10(self.power))
+
+    @property
+    def rms(self) -> float:
+        """Root-mean-square amplitude."""
+        return float(np.sqrt(self.power))
+
+    # ---- full-scale check --------------------------------------------
+
+    @property
+    def full_scale_fraction(self) -> float:
+        """
+        Fraction of complex samples where I or Q is at full scale.
+
+        Full scale is ``±(2**sample_size - 1)`` after the 2k+1 transform
+        (§5.3.6).  The outermost code is the overflow bin: it holds every
+        input from just below full scale upward, so a sample there may or
+        may not have been clipped, and the data cannot tell which.  Read the
+        ratio against what the bit depth and gain setting make normal, not
+        as a count of clipped samples:
+
+        - 1-bit: every value is ±1, i.e. full scale, so the ratio would be
+          1.0 by construction and says nothing.  Warns and returns 0.0.
+        - 2-bit (codes ±1, ±3) and 4-bit: coarse quantizers use their outer
+          levels routinely, so a ratio above 0 is expected on any real
+          record.
+        - 8- and 16-bit: a ratio above 0 means the input reached full scale;
+          a large one points to a gain set too high.
+
+        Returns
+        -------
+        float
+            Between 0.0 and 1.0; NaN for an empty record (as ``power``).
+
+        Warns
+        -----
+        UserWarning
+            For 1-bit samples (see above).  Returns 0.0.
+        """
+        threshold = _FULL_SCALE[self.sample_size]
+        if self.sample_size == 1:
+            warnings.warn(
+                "Full-scale fraction is undefined for 1-bit samples "
+                "(all values are inherently ±1)",
+                stacklevel=2,
+            )
+            return 0.0
+        i, q = self._pair()
+        n = len(i)
+        if n == 0:
+            return float("nan")
+        # Four 1-byte bool temps instead of two full-width abs() copies.
+        hit = i >= threshold
+        hit |= i <= -threshold
+        hit |= q >= threshold
+        hit |= q <= -threshold
+        return float(np.count_nonzero(hit) / n)
+
+    # ---- time-domain helpers ------------------------------------------
+
+    @property
+    def duration_s(self) -> float:
+        """Duration in seconds (requires ``sample_rate``)."""
+        return len(self) / self._require_sample_rate()
+
+    @property
+    def time_array(self) -> np.ndarray:
+        """
+        Sample times in seconds from the first sample, i.e. from
+        ``Record.header.timetag`` (requires ``sample_rate``).
+        """
+        return np.arange(len(self)) / self._require_sample_rate()
+
+
+# =============================================================================
+# Record
+# =============================================================================
+
+
+class Record:
+    """
+    Single RDEF record: one header plus one second of I/Q (§5.1).
+
+    A record read from a file knows where its samples are on disk but does
+    not hold them.  ``record.data`` reads and decodes them on each access;
+    nothing keeps them, so they are freed as soon as you drop the result.
+    ``load()`` keeps them in memory until ``release()``.
+
+    Attributes
+    ----------
+    header : RecordHeader
+    data : RecordData
+        The samples -- from memory when loaded, else read from disk now.
+
+    Notes
+    -----
+    On an unloaded record, every ``record.data`` access that finds no live
+    result reads the file again: ``record.data.power`` then
+    ``record.data.samples`` decodes twice.  Take ``d = record.data`` once
+    and reuse ``d``; while ``d`` is alive, further ``record.data`` accesses return the same object
+    without touching the disk.  Arrays read this way are read-only -- to edit
+    samples, ``load()`` first or assign ``record.data = new_data``.
+
+    For complex samples only, ``record.read_samples(out=buf)`` decodes the
+    bytes straight to complex, with no integer I/Q arrays, and refills
+    *buf*: the same values as ``record.data.samples``, in less time.
+
+    A record built in memory, ``Record(header, data)``, has no file behind
+    it: it is always loaded and ``release()`` does nothing.
+    """
+
+    __slots__ = ("header", "_data", "_source", "_weak", "_index")
+
+    header: RecordHeader
+    _data: RecordData | None
+    _source: Any  # reader._DiskSource, or None for a record built in memory
+    _weak: weakref.ref | None
+    _index: int | None
+
+    def __init__(
+        self,
+        header: RecordHeader | dict | None = None,
+        data: RecordData | None = None,
+    ):
+        """
+        Parameters
+        ----------
+        header : RecordHeader, dict, or None
+            Created empty if *None*, wrapped if *dict*.
+        data : RecordData or None
+            Defaults to an empty 16-bit RecordData.
+        """
+        if isinstance(header, RecordHeader):
+            self.header = header
+        elif header is None:
+            self.header = RecordHeader()
+        else:
+            self.header = RecordHeader(header)
+
+        self._data: RecordData | None = (
+            data if data is not None else RecordData(sample_size=16)
+        )
+        # On-disk location of the samples (reader._DiskSource), or None for
+        # a record built in memory.
+        self._source = None
+        # Weak reference to the last transient read: shared while anyone
+        # holds it, freed when nobody does.
+        self._weak: weakref.ref | None = None
+        # Position within a parent ProductFile; set by ProductFile.__getitem__.
+        self._index: int | None = None
+
+    @classmethod
+    def _on_disk(cls, header: RecordHeader, source) -> Record:
+        """A record whose samples stay on disk until accessed or loaded."""
+        rec = cls.__new__(cls)
+        rec.header = header
+        rec._data = None
+        rec._source = source
+        rec._weak = None
+        rec._index = None
+        return rec
+
+    # ---- samples: on access, load, release --------------------------------
+
+    @property
+    def data(self) -> RecordData:
+        """The samples, from memory when loaded, otherwise read from disk now."""
+        if self._data is not None:
+            return self._data
+        live = self._weak() if self._weak is not None else None
+        if live is not None:
+            return live
+        data = self._source.read(self.header, writeable=False)
+        self._weak = weakref.ref(data)
+        return data
+
+    @data.setter
+    def data(self, value: RecordData) -> None:
+        # Assigned samples replace the file's: the record is now in memory.
+        if not isinstance(value, RecordData):
+            raise TypeError(f"data must be a RecordData, got {type(value).__name__}")
+        self._data = value
+        self._source = None
+        self._weak = None
+
+    def read_samples(self, out: np.ndarray | None = None) -> np.ndarray:
+        """
+        The complex samples ``I + jQ``, optionally written into *out*.
+
+        Same values as ``record.data.samples``, bit for bit, but faster on
+        a record whose samples are on disk: the bytes are decoded straight
+        to complex, with no integer I/Q arrays in between.
+
+        Parameters
+        ----------
+        out : np.ndarray, optional
+            Array to fill: 1-D, C-contiguous, writeable, complex64 or
+            complex128, exactly ``len(record)`` long; its dtype sets the
+            precision (both are exact).  ``None`` (default) returns a new
+            array at the record's ``complex_dtype``.
+
+        Returns
+        -------
+        np.ndarray
+            *out*, filled, or the new array.
+
+        Raises
+        ------
+        ValueError
+            If *out* does not meet the requirements above.
+
+        Notes
+        -----
+        Passing back the previous result skips allocating and freeing a
+        large array on every record (320 MB per 16-bit 20 Msps record at
+        complex128).  It is overwritten, so copy anything you keep; if the
+        call raises, *out* may be partly overwritten::
+
+            buf = None
+            for rec in pf:
+                buf = rec.read_samples(out=buf)
+                process(buf)
+        """
+        live = self._data
+        if live is None and self._weak is not None:
+            live = self._weak()  # samples someone already read: no disk read
+        n = len(live) if live is not None else len(self)
+        if out is None:
+            cdt = live.complex_dtype if live is not None else self._source.complex_dtype
+            out = np.empty(n, dtype=cdt)
+        else:
+            _check_complex_out(out, n)
+        if live is not None:
+            return live._fill_complex(out)
+        return self._source.read_complex(self.header, out)
+
+    def load(self) -> None:
+        """Read the samples into memory and keep them until ``release()``."""
+        if self._data is None:
+            self._data = self._source.read(self.header, writeable=True)
+            self._weak = None
+
+    def release(self) -> None:
+        """
+        Drop loaded samples; later access reads them from disk again.
+
+        Discards any in-memory edits.  No effect on a record built in memory,
+        which has no file to re-read.
+        """
+        if self._source is not None:
+            self._data = None
+
+    def __len__(self) -> int:
+        """Number of complex samples, without reading them from disk."""
+        if self._data is not None:
+            return len(self._data)
+        return self._source.n_samples(self.header)
+
+    def __bool__(self) -> bool:
+        # A record is a record even with 0 samples; __len__ must not make
+        # ``if record:`` false.
+        return True
+
+    def __getstate__(self):
+        # The weak reference cannot be pickled or copied; nothing is decoded.
+        return (self.header, self._data, self._source, self._index)
+
+    def __setstate__(self, state) -> None:
+        self.header, self._data, self._source, _ = state
+        self._weak = None
+        self._index = None  # a copy's position is set when it is reached again
+
+    def __repr__(self) -> str:
+        return _display.record_repr(self)
+
+    def __str__(self) -> str:
+        return _display.record_str(self)
+
+    def correct_header(self, **kwargs) -> None:
+        """
+        Update ``RecordHeader`` fields for this single record, in place.
+
+        Parameters
+        ----------
+        **kwargs
+            RecordHeader field names and their new values.
+
+        Raises
+        ------
+        ValueError
+            If an unknown field name is provided.
+
+        Examples
+        --------
+        Mark a single record as invalid:
+
+        >>> rec.correct_header(validity_flag=1)
+
+        Notes
+        -----
+        For bulk edits across all records use ``ProductFile.correct_header()``.
+        """
+        for key in kwargs:
+            if key not in _HEADER_FIELDS:
+                raise ValueError(
+                    f"Unknown header field: {key!r}. "
+                    f"Valid fields: {list(_HEADER_FIELDS)}"
+                )
+
+        for key, value in kwargs.items():
+            setattr(self.header, key, value)
+
+    @property
+    def downconversion_frequency(self) -> np.ndarray:
+        """
+        Total downconversion frequency for all samples in the record.
+
+        Computes the full downconverter frequency as defined in CCSDS
+        506.1-B-1 §5.2.6, combining fixed and variable components.
+
+        **Fixed part (constant):**
+            f_DC_fixed = rf_to_if_downconv + if_to_channel_downconv
+
+        **Variable part (time-dependent):**
+            f_DC_var(t) = c1 + 2·c2·(t-t0) + 3·c3·(t-t0)²
+
+        **Total:**
+            f_DC(t) = f_DC_fixed + f_DC_var(t)
+
+        Returns
+        -------
+        np.ndarray
+            Downconversion frequency in Hz for each sample. Shape matches
+            the number of I/Q samples in the record.
+
+        Notes
+        -----
+        - Time origin t0 = TIME TAG SECOND OF DAY (Table 5-1, §5.2.6.2)
+          plus ``t0_offset``: sample k is at
+          ``t - t0 = ps*1e-12 - t0_offset + k/fs``.
+        - NaN when c1, c2 and c3 are NaN (DSN 0222 Millisecond Predict
+          mode: the variable part is not in the file).
+        - Phase polynomial coefficients are in turns/s (Hz for c1), turns/s²
+          for c2, and turns/s³ for c3.
+        - Per §5.2.6, the fixed IF-to-channel downconverter is assumed to
+          have integer phase at integer-second boundaries.
+
+        References
+        ----------
+        CCSDS 506.1-B-1 (June 2013), §5.2.6 (downconversion: fixed plus variable frequency)
+        """
+        n_samples = len(self)
+        if n_samples == 0:
+            return np.array([], dtype=np.float64)
+        return _downconv_hz(self.header, _sample_times(self.header, n_samples))
+
+    @property
+    def downconversion_phase(self) -> np.ndarray:
+        """
+        Variable-part downconversion phase for all samples in the record.
+
+        Evaluates the phase polynomial from the record header as
+        defined in CCSDS 506.1-B-1 §5.2.6.2:
+
+            φ_variable(t) = Φ + c0 + c1·t + c2·t² + c3·t³
+
+        where ``Φ`` is CHANNEL ACCUMULATED PHASE (whole turns of the
+        channel variable downconverter, Table 5-1; it does not include
+        the fixed part), ``c0-c3``
+        are the CHANNEL PHASE POLYNOMIAL COEFFICIENTS, and ``t`` is
+        measured from the origin t0 = TIME TAG SECOND OF DAY (see
+        ``downconversion_frequency``).
+
+        The fixed-part phase ramp (from ``rf_to_if_downconv`` and
+        ``if_to_channel_downconv``) is not included: its time reference
+        t_b is "generally unknown" (§5.2.6.1).  So the time derivative of
+        this phase is ``downconversion_frequency`` minus the fixed
+        frequency ``rf_to_if_downconv + if_to_channel_downconv``.
+
+        Returns
+        -------
+        np.ndarray
+            Downconversion phase in turns (cycles) for each sample.
+
+        References
+        ----------
+        CCSDS 506.1-B-1 (June 2013), §5.2.6
+        """
+        n_samples = len(self)
+        if n_samples == 0:
+            return np.array([], dtype=np.float64)
+        return _downconv_phase(self.header, _sample_times(self.header, n_samples))
+
+
+def _load_records(records, *, progress: bool = False) -> None:
+    """Load every not-yet-loaded record, one open handle per file, in order."""
+    todo = [r for r in records if r._data is None]
+    handles: dict = {}
+    try:
+        with _Progress(len(todo), progress) as pbar:
+            for rec in todo:
+                src = rec._source
+                f = handles.get(src.path)
+                if f is None:
+                    f = handles[src.path] = src.open()
+                rec._data = src.read(rec.header, writeable=True, f=f)
+                rec._weak = None
+                pbar.update(1)
+    finally:
+        for f in handles.values():
+            f.close()
+
+
+# =============================================================================
+# ProductFile
+# =============================================================================
+
+
+class _RecordList(list):
+    """``pf[a:b]``: a plain list of the records, printed one per line."""
+
+    def __repr__(self) -> str:
+        if not self:
+            return "[]"
+        return "[\n" + "".join(f"  {r!r},\n" for r in self) + "]"
+
+
+class _FileView:
+    """
+    Whole-file per-sample values indexed like one array (``pf.samples``,
+    ``pf.timetags``): sample *n* counts from the first record across record
+    boundaries.  Subclasses fill ``_read(a, b)`` for samples ``[a, b)``.
+    """
+
+    __slots__ = ("_pf",)
+    _what = ""
+
+    def __init__(self, pf: ProductFile):
+        self._pf = pf
+
+    def __len__(self) -> int:
+        return sum(len(r) for r in self._pf.records)
+
+    def __repr__(self) -> str:
+        return f"<{len(self):,} {self._what} in {len(self._pf.records)} records>"
+
+    def __array__(self, dtype=None, copy=None):
+        # np.asarray(view): one read of the whole file, not one per element.
+        if copy is False:
+            raise ValueError(f"{self._what} are read from the records: a copy is always made")
+        x = self[:]
+        return x if dtype is None else x.astype(dtype, copy=False)
+
+    def __getitem__(self, idx: int | slice):
+        n = len(self)
+        if isinstance(idx, slice):
+            r = range(*idx.indices(n))
+            if not r:
+                return self._read(0, 0)
+            if r.step < 0:
+                return self[r[-1] : r[0] + 1 : -r.step][::-1]
+            if r.step == 1:
+                return self._read(r.start, r.stop)
+            # Strided: read each record only from its first to its last
+            # selected sample, not the whole span (pf.samples[::fs] would
+            # otherwise decode the entire file).
+            a, b, step = r.start, r[-1] + 1, r.step
+            self._check(a, b)
+            out, pos = None, 0
+            for _, _, _, lo, hi in self._parts(a, b):
+                first = lo + (a - lo) % step
+                if first < hi:
+                    last = first + (hi - 1 - first) // step * step
+                    x = self._read(first, last + 1)[::step]
+                    if out is None:
+                        out = np.empty(len(r), dtype=x.dtype)
+                    out[pos : pos + len(x)] = x
+                    pos += len(x)
+                    del x  # free this record's read before the next one
+            return out
+        i = operator.index(idx)
+        if not -n <= i < n:
+            raise IndexError(f"sample index {idx} out of range for {n} samples")
+        i %= n
+        return self._read(i, i + 1)[0]
+
+    def _parts(self, a: int, b: int):
+        """``(index, record, its first sample in the file, lo, hi)`` for each
+        record overlapping ``[a, b)``, ``lo:hi`` the overlap in file sample
+        numbers.  Header-only."""
+        start = 0
+        for k, rec in enumerate(self._pf.records):
+            end = start + len(rec)
+            if end > a and start < b:
+                yield k, rec, start, max(a, start), min(b, end)
+            if end >= b:
+                break
+            start = end
+
+    def _check(self, a: int, b: int) -> None:
+        """Raise if ``[a, b)`` cannot be read as one run; default: always can."""
+
+    def _read(self, a: int, b: int) -> np.ndarray:
+        raise NotImplementedError
+
+
+class _FileTimetags(_FileView):
+    """
+    ``pf.timetags``: the time of every sample, ``datetime64[ns]``.
+
+    Sample *k* of a record is at ``header.timetag + k / sample_rate``,
+    rounded to the nanosecond.  Header-only: no samples are read.  Gaps
+    between records show in the times; nothing is raised.
+    """
+
+    __slots__ = ()
+    _what = "sample timetags"
+
+    def _read(self, a: int, b: int) -> np.ndarray:
+        out = np.empty(b - a, dtype="datetime64[ns]")
+        for k, rec, start, lo, hi in self._parts(a, b):
+            t0 = _record_epoch(rec.header)
+            if t0 is None:
+                raise ValueError(f"record {k} has no usable time tag")
+            rate = int(_header_sample_rate(rec.header))
+            k = np.arange(lo - start, hi - start, dtype=np.int64)
+            ns = (2 * k * 1_000_000_000 + rate) // (2 * rate)  # k/rate s in ns, rounded half up
+            out[lo - a : hi - a] = t0 + ns.astype("timedelta64[ns]")
+        return out
+
+
+class _FileDownconversion(_FileView):
+    """
+    ``pf.downconversion_frequency`` (total: fixed + variable) /
+    ``pf.downconversion_phase`` (variable part only): the §5.2.6
+    polynomial of each record evaluated at each of its samples, from the
+    origin set by ``pf.t0_offset`` (as ``Record.downconversion_frequency``).
+    Header-only.  Gaps between records are not checked; see ``pf.timetags``.
+    """
+
+    __slots__ = ("_fn", "_what")
+
+    def __init__(self, pf: ProductFile, fn, what: str):
+        super().__init__(pf)
+        self._fn = fn
+        self._what = what
+
+    def _read(self, a: int, b: int) -> np.ndarray:
+        out = np.empty(b - a, dtype=np.float64)
+        for _, rec, start, lo, hi in self._parts(a, b):
+            t = np.arange(lo - start, hi - start, dtype=np.float64) / _header_sample_rate(rec.header)
+            out[lo - a : hi - a] = self._fn(rec.header, _origin_offset(rec.header, self._pf._t0_offset) + t)
+        return out
+
+
+class _FileSamples(_FileView):
+    """
+    ``pf.samples``: the whole file's complex samples, indexed like one array.
+
+    ``pf.samples[a:b]`` returns ``I + jQ`` for samples *a* to *b* counted
+    from the first record, across record boundaries.  Only the records the
+    range touches are read, each straight into the result.  Raises
+    ``ValueError`` if the range spans a time gap (records not 1 s apart,
+    including a leap second, which NumPy cannot represent), a change of
+    sample rate, or a record shorter than 1 s: joining would put samples
+    at the wrong times.
+    """
+
+    __slots__ = ()
+    _what = "complex samples"
+
+    def _check(self, a: int, b: int) -> None:
+        parts = list(self._parts(a, b))
+        for (k, r0, *_), (_, r1, *_) in zip(parts, parts[1:]):
+            fs0, fs1 = r0.header.sample_rate, r1.header.sample_rate
+            if fs0 != fs1 or len(r0) != fs0:
+                raise ValueError(
+                    f"samples {a}:{b} span records {k} and {k + 1}, whose sample rates "
+                    f"differ or the first is not 1 s long ({len(r0)} samples at "
+                    f"{fs0} Hz, then {fs1} Hz): read each record separately"
+                )
+            t0, t1 = _record_epoch(r0.header), _record_epoch(r1.header)
+            dt = None if t0 is None or t1 is None else (t1 - t0) / np.timedelta64(1, "s")
+            if dt is None or abs(dt - 1.0) > 1e-6:
+                raise ValueError(
+                    f"samples {a}:{b} span records {k} and {k + 1}, which are not "
+                    f"1 s apart (dt = {dt} s): read each side of the gap separately"
+                )
+
+    def _read(self, a: int, b: int) -> np.ndarray:
+        """Samples [a, b) of the file, 0 <= a <= b <= len(self)."""
+        self._check(a, b)
+        parts = list(self._parts(a, b))
+        recs = self._pf.records
+        first = parts[0][1] if parts else (recs[0] if recs else None)
+        if first is None:
+            return np.empty(0, np.complex128)
+        live = first._data if first._data is not None else (first._weak() if first._weak else None)
+        cdt = live.complex_dtype if live is not None else first._source.complex_dtype
+        out = np.empty(b - a, dtype=cdt)
+        for _, rec, start, lo, hi in parts:
+            if lo == start and hi == start + len(rec):  # whole record: decode in place
+                rec.read_samples(out=out[lo - a : hi - a])
+            else:
+                x = rec.read_samples()
+                out[lo - a : hi - a] = x[lo - start : hi - start]
+        return out
+
+
+class ProductFile:
+    """
+    Container for a complete RDEF product file (.prd).
+
+    A product file holds one or more sequential one-second records
+    (CCSDS 506.1-B-1 §5) for a single scan, channel, and station.
+
+    Parameters
+    ----------
+    name : str
+        Human-readable name (e.g. filename stem).  Defaults to ``""``.
+
+    Attributes
+    ----------
+    records : list[Record]
+        Ordered list of records.
+    name : str
+        Human-readable name for this product file.
+    path : Path or None
+        Absolute path of the file the records were read from; ``None`` for
+        a product file built in memory or merged from different files.
+        Kept by ``select``/``slice``/``copy``; not changed by
+        ``write_product``.
+    t0_offset : float
+        Read-only.  The ``t0_offset`` passed to the reader (0.0 by default);
+        see the property.
+    agency_layout : str or np.dtype
+        Read-only.  Layout of the internal-agency block for
+        ``agency_fields``; see the property.
+    """
+
+    # Class-level defaults, used by a product file built by hand.
+    _t0_offset = 0.0
+    _agency_layout = "auto"
+
+    def __init__(self, *, name: str = ""):
+        self.records: list[Record] = []
+        self.name: str = name
+        self.path: Path | None = None
+
+    @property
+    def t0_offset(self) -> float:
+        """
+        Shift of the §5.2.6 polynomial origin from TIME TAG SECOND OF DAY,
+        in seconds (read-only).
+
+        0.0, the spec reading (CCSDS 506.1-B-1 §5.2.6.2, DSN 0222 §3.4),
+        unless another value was passed to ``read_product`` /
+        ``read_headers`` for a producer known to use another origin.  Every
+        downconversion value and ``extract_carrier`` follow it; sample k is
+        at ``ps*1e-12 - t0_offset + k/fs`` from the origin.  To change it,
+        read the file again.
+        """
+        return self._t0_offset
+
+    @property
+    def agency_layout(self) -> str | np.dtype:
+        """
+        Layout of the 40-byte internal-agency block for ``agency_fields``
+        (read-only).
+
+        Set when reading (``read_product`` / ``read_headers``, keyword
+        ``agency_layout``); ``"auto"`` when it was not passed, and for a
+        product file built by hand.
+
+        * ``"auto"``: agency_flag 3 (NASA) -> ``"dsn"``; any other
+          agency_flag -> the raw bytes, one field ``"raw"`` (``V40``).
+        * ``"dsn"``: ``DSN_AGENCY_DTYPE`` (DSN 820-013 0222-Science Rev. A,
+          Table 3-1), whatever the agency_flag.
+        * anything ``np.dtype()`` accepts with itemsize 40 and no object
+          fields (a list of ``(name, type)`` tuples, ``"<u2,u1,<f8,V29"``,
+          ...).
+
+        To decode with another layout, read the file again.
+        ``slice``/``copy``/``select`` keep it, ``concatenate`` keeps self's;
+        a ``Record`` moved by hand between files keeps the layout stamped
+        on its header for ``header.agency_fields()``.
+        """
+        return self._agency_layout
+
+    def agency_fields(self) -> np.ndarray:
+        """
+        Every record's internal-agency block, decoded: one structured row per
+        record, in record order (header-only).
+
+        Layout from ``agency_layout``; ``"auto"`` decides once for the file
+        from its agency_flag (3: DSN OLR fields, else the raw bytes in field
+        ``"raw"``).  One ``np.frombuffer`` over the joined blocks; values
+        are raw (no code mapping, no unit conversion); the array is
+        read-only.  Never decoded unless called.
+
+        Raises
+        ------
+        ValueError
+            If a block is not 40 bytes.
+
+        Warns
+        -----
+        RuntimeWarning
+            With ``"auto"``, if agency_flag differs between records; the raw
+            bytes (field ``"raw"``) are returned for every record.
+        """
+        dt = _agency_dtype(self._agency_layout, [r.header.agency_flag for r in self.records])
+        return np.frombuffer(b"".join(_agency_bytes(r.header) for r in self.records), dtype=dt)
+
+    def _set_read_settings(self, t0_offset: float, agency_layout) -> None:
+        """Store the read-time settings (already checked) and stamp every record."""
+        self._t0_offset, self._agency_layout = t0_offset, agency_layout
+        for rec in self.records:
+            rec.header._t0_offset = t0_offset
+            rec.header._agency_layout = agency_layout
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    @overload
+    def __getitem__(self, idx: int) -> Record: ...
+    @overload
+    def __getitem__(self, idx: slice) -> list[Record]: ...
+
+    def __getitem__(self, idx: int | slice) -> Record | list[Record]:
+        result = self.records[idx]
+        if isinstance(idx, slice):
+            return _RecordList(result)
+        result._index = idx + len(self.records) if idx < 0 else idx
+        return result
+
+    def __iter__(self) -> Iterator[Record]:
+        """Iterate over records in order."""
+        for i, rec in enumerate(self.records):
+            rec._index = i  # as pf[i] does, so str(rec) shows its number
+            yield rec
+
+    def __repr__(self) -> str:
+        return _display.product_repr(self)
+
+    def __str__(self) -> str:
+        return _display.product_str(self)
+
+    def info(self, buf: TextIO | None = None) -> None:
+        """
+        Print a summary of the product file.
+
+        Same text as ``str(product_file)``: right-aligned ``label: value``
+        rows, labelled by attribute name where one exists.  Derived rows:
+
+        * ``first_timetag`` / ``last_timetag`` -- earliest and latest record
+          START epochs (ISO 8601, nanoseconds, ``Z`` suffix; station time,
+          an approximation to UTC, §5.2.5).
+        * ``consecutive`` -- whether records are spaced 1 s, within 1 µs (§5.1).
+          A leap-second record (SECOND OF DAY 86400) shows as a duplicate
+          time here, so ``consecutive`` reads False across it; see
+          ``RecordHeader.timetag``.
+        * ``band`` -- each record's fixed downconversion
+          (``rf_to_if + if_to_channel``) classified into the nominal DSN
+          S/X/Ka allocations; ``unknown`` if it matches none.
+        * ``frequency_steering`` -- ``True`` when the variable downconversion
+          is time-varying: any nonzero c2/c3, or c1 changing between records.
+
+        Parameters
+        ----------
+        buf : text stream, optional
+            Where to write (``sys.stdout`` when None), as in
+            ``pandas.DataFrame.info``.
+        """
+        print(_display.product_str(self), file=buf)
+
+    # ---- header editing -----------------------------------------------
+
+    def correct_header(self, **kwargs) -> None:
+        """
+        Set header fields on every record, in place.
+
+        Nothing guards against it: correcting a header is a deliberate act.
+
+        Parameters
+        ----------
+        **kwargs
+            RecordHeader field names and their new values.
+
+        Raises
+        ------
+        ValueError
+            If unknown field name is provided.
+
+        Examples
+        --------
+        Bulk correction of common fields:
+
+        >>> pf.correct_header(station_id=24, spacecraft_id=1)
+
+        Mixed bulk and single-record editing:
+
+        >>> pf.correct_header(station_id=24)               # bulk
+        >>> pf.records[5].correct_header(validity_flag=1)  # single
+
+        See Also
+        --------
+        Record.correct_header : Edit a single record header.
+        """
+        valid_fields = set(_HEADER_FIELDS)
+        for key in kwargs:
+            if key not in valid_fields:
+                raise ValueError(
+                    f"Unknown header field: {key!r}. "
+                    f"Valid fields: {list(_HEADER_FIELDS)}"
+                )
+
+        for rec in self.records:
+            rec.correct_header(**kwargs)
+
+    def _check_constant_fields(self) -> None:
+        """Warn when a field that must be file-constant varies between records."""
+        varying_fields = set()
+        for field in _FILE_CONSTANT_FIELDS:
+            values = [
+                _same_key(getattr(r.header, field))
+                for r in self.records
+                if getattr(r.header, field) is not None
+            ]
+            if values and not all(v == values[0] for v in values):
+                varying_fields.add(field)
+
+        if varying_fields:
+            warnings.warn(
+                f"Metadata fields vary across records: {sorted(varying_fields)}; "
+                f"a product file should be one channel of one station (§5).",
+                RuntimeWarning,
+                stacklevel=_user_stacklevel(),
+            )
+
+    # ---- concatenation ------------------------------------------------
+
+    def concatenate(
+        self,
+        other: ProductFile,
+        keep: str = "other",
+        sort: bool = True,
+    ) -> ProductFile:
+        """
+        Merge two product files of the same channel into a new one.
+
+        Records from both files are merged and, by default, sorted
+        chronologically by their time tags (year, DOY, second-of-day,
+        picoseconds).  When two records share the same time tag the
+        duplicate is reported and resolved according to *keep*.  The result
+        holds independent copies of the records (headers and disk locations;
+        samples only where loaded), so editing, loading or releasing it never
+        touches *self* or *other*.
+
+        Parameters
+        ----------
+        other : ProductFile
+            The product file to concatenate with this one.
+        keep : str
+            Which duplicate to retain: ``"other"`` (default) keeps the
+            record from *other*; ``"self"`` keeps the record from this
+            file; ``"both"`` keeps both (no deduplication).  With
+            ``"self"`` or ``"other"``, a time tag repeated within one input
+            keeps its last record.
+        sort : bool
+            If ``True`` (default), sort the merged records by time tag.
+            If ``False``, records from *self* appear first, followed by
+            records from *other*, preserving their original order; with
+            ``keep="other"``, a record of *other* that replaces one of
+            *self* takes its place.
+
+        Returns
+        -------
+        ProductFile
+            New product file, named after *self*; its ``path`` is the
+            inputs' common file, or ``None`` if they came from different files.
+
+        Raises
+        ------
+        ValueError
+            If *keep* is not one of ``"self"``, ``"other"``, or ``"both"``;
+            or if the files disagree on a field that must be constant
+            across a product file (station, spacecraft, agency, version,
+            sample size, sample rate, fixed downconversion): a product file
+            is one scan, one channel, one station (§5).
+
+        Warns
+        -----
+        RuntimeWarning
+            On duplicate time tags, within an input or between the two.
+        """
+        valid_keep = ("self", "other", "both")
+        if keep not in valid_keep:
+            raise ValueError(f"keep must be one of {valid_keep}, got {keep!r}")
+
+        # Same channel? Compare every file-constant field across both inputs.
+        clash = []
+        for field in _FILE_CONSTANT_FIELDS:
+            ours = {_same_key(getattr(r.header, field)) for r in self.records} - {None}
+            theirs = {_same_key(getattr(r.header, field)) for r in other.records} - {None}
+            if ours and theirs and ours != theirs:
+                clash.append(f"{field}: {sorted(ours, key=repr)} vs {sorted(theirs, key=repr)}")
+        if clash:
+            raise ValueError(
+                "Cannot concatenate product files of different channels "
+                "(§5: one scan, one channel, one station per file); "
+                "differing fields: " + "; ".join(clash)
+            )
+
+        def _sort_key(rec: Record) -> tuple:
+            h = rec.header
+            return (
+                h.time_tag_year or 0,
+                h.time_tag_doy or 0,
+                h.time_tag_second_of_day or 0,
+                h.time_tag_picoseconds_of_the_second or 0.0,
+            )
+
+        for label, recs in (("self", self.records), ("other", other.records)):
+            n_dup = len(recs) - len({_sort_key(r) for r in recs})
+            if n_dup:
+                tail = "." if keep == "both" else "; keeping the last of each."
+                warnings.warn(
+                    f"{n_dup} duplicate time tag(s) within {label}{tail}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        if keep == "both":
+            merged = list(self.records) + list(other.records)
+            n_dup = len(merged) - len({_sort_key(r) for r in merged})
+            if n_dup:
+                warnings.warn(
+                    f"{n_dup} duplicate time tag(s) detected; "
+                    f"keeping all records (keep='both').",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        else:
+            self_by_key = {_sort_key(r): r for r in self.records}
+            other_by_key = {_sort_key(r): r for r in other.records}
+            duplicates = self_by_key.keys() & other_by_key.keys()
+            if duplicates:
+                warnings.warn(
+                    f"{len(duplicates)} duplicate time tag(s) detected; "
+                    f"keeping records from '{keep}'.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            if keep == "other":  # other overwrites self on collision
+                merged = list({**self_by_key, **other_by_key}.values())
+            else:  # self wins on collision; self's records still come first
+                merged = list({**self_by_key, **{k: r for k, r in other_by_key.items()
+                                                 if k not in self_by_key}}.values())
+
+        if sort:
+            merged.sort(key=_sort_key)
+        return self._new_from(merged, path=self.path if self.path == other.path else None)
+
+    def _new_from(self, records: list[Record], path: Path | None = ...) -> ProductFile:
+        """New product file named after self, holding independent copies of *records*."""
+        pf = ProductFile(name=self.name)
+        pf.path = self.path if path is ... else path
+        # deepcopy copies headers and disk locations; samples only if loaded.
+        # One record at a time: a record listed twice (a file concatenated
+        # with itself) gives two independent copies, not one shared object.
+        pf.records = [copy.deepcopy(r) for r in records]
+        pf._set_read_settings(self._t0_offset, self._agency_layout)
+        pf._check_constant_fields()
+        return pf
+
+    # ---- slicing ------------------------------------------------------
+
+    def slice(self, start: int, stop: int | None = None) -> ProductFile:
+        """
+        Records by index, as a new product file.
+
+        ``slice(i)`` is the one record at *i* (``-1`` is the last);
+        ``slice(i, j)`` is records ``i`` up to, not including, ``j``, with
+        list-slice semantics.  To select by time, use :meth:`select`.
+
+        Parameters
+        ----------
+        start : int
+            Index of the first record.
+        stop : int or None
+            Index one past the last record; ``None`` takes only *start*.
+
+        Returns
+        -------
+        ProductFile
+            New product file with independent copies of the selected
+            records (samples copied only where loaded); the copies still
+            read unloaded samples from the original file.
+
+        Raises
+        ------
+        IndexError
+            If *stop* is None and *start* is out of range.
+        TypeError
+            If *start* or *stop* is not an integer.
+        """
+        start = operator.index(start)
+        if stop is None:  # the one record at *start*; -1 is the last
+            return self._new_from([self.records[start]])
+        return self._new_from(self.records[start : operator.index(stop)])
+
+    def select(
+        self,
+        *,
+        filters: dict | None = None,
+        min_downconv_hz: float | None = None,
+        max_downconv_hz: float | None = None,
+        start_epoch: datetime | np.datetime64 | str | None = None,
+        stop_epoch: datetime | np.datetime64 | str | None = None,
+    ) -> ProductFile:
+        """
+        Records matching all the given criteria, as a new product file.
+
+        The original is untouched.  Same criteria, with the same meaning,
+        as the filters of :func:`read_product`.
+
+        Parameters
+        ----------
+        filters : dict, optional
+            Header-field exact-match filters.  Keys are RecordHeader
+            field names (e.g. ``"station_id"``); values are the
+            expected values.  Records must match **all** filters.
+        min_downconv_hz : float, optional
+            Minimum total downconversion frequency in Hz, evaluated at each
+            record's first sample (``record_downconversion_frequency``).  A
+            record whose c1, c2 and c3 are all NaN (DSN 0222 Millisecond
+            Predict) is compared on its fixed part,
+            ``rf_to_if_downconv + if_to_channel_downconv``.
+        max_downconv_hz : float, optional
+            Maximum total downconversion frequency in Hz.
+        start_epoch, stop_epoch : datetime, np.datetime64, str, or None, optional
+            Keep records with ``start_epoch <= timetag < stop_epoch``
+            (half-open, so consecutive windows tile without overlap or
+            gap), compared on the full time tag, picoseconds included.  A
+            naive ``datetime`` is UTC.
+
+        Returns
+        -------
+        ProductFile
+            New product file with independent copies of the kept records
+            (samples copied only where loaded); the copies still read
+            unloaded samples from the original file.
+
+        Raises
+        ------
+        ValueError
+            If a filter key is not a valid RecordHeader field name.
+
+        Examples
+        --------
+        Records from station 24::
+
+            >>> pf = read_product("scan.prd")
+            >>> sub = pf.select(filters={"station_id": 24})
+
+        A five-minute window within a downconversion-frequency band::
+
+            >>> sub = pf.select(
+            ...     start_epoch="2026-039T12:00:00",
+            ...     stop_epoch="2026-039T12:05:00",
+            ...     min_downconv_hz=8.4e9,
+            ...     max_downconv_hz=8.5e9,
+            ... )
+        """
+        if filters:
+            valid_fields = _HEADER_FIELD_SET
+            for field in filters:
+                if field not in valid_fields:
+                    raise ValueError(
+                        f"Unknown header field in filters: {field!r}. "
+                        f"Valid fields: {sorted(valid_fields)}"
+                    )
+
+        t0 = _to_datetime64(start_epoch)
+        t1 = _to_datetime64(stop_epoch)
+
+        kept: list[Record] = []
+        for rec in self.records:
+            hdr = rec.header
+
+            # Header field filtering
+            if filters and any(getattr(hdr, f) != v for f, v in filters.items()):
+                continue
+
+            # Downconversion frequency filtering (at the first sample)
+            if min_downconv_hz is not None or max_downconv_hz is not None:
+                if not _in_window(_filter_downconv_hz(hdr, self._t0_offset), min_downconv_hz, max_downconv_hz):
+                    continue
+
+            # Time-window filtering
+            if t0 is not None or t1 is not None:
+                epoch = _record_epoch(hdr)
+                if epoch is None:
+                    continue
+                if t0 is not None and epoch < t0:
+                    continue
+                if t1 is not None and epoch >= t1:
+                    continue
+
+            kept.append(rec)
+
+        return self._new_from(kept)
+
+    # ---- samples ------------------------------------------------------
+
+    @property
+    def samples(self) -> _FileSamples:
+        """
+        The file's complex samples ``I + jQ``, sliceable across records.
+
+        ``pf.samples[:1024]`` returns the first 1024 samples even when a
+        record holds fewer (1 kHz: 1000 per record); ``pf.samples[a:b]``
+        any range, ``len(pf.samples)`` the total.  Only the records the
+        range touches are read.  Values are those of
+        ``record.data.samples``, bit for bit, at the records'
+        ``complex_dtype``; the result is the caller's own array.
+        ``np.asarray(pf.samples)`` is ``pf.samples[:]``.
+
+        Raises ``ValueError`` if the range spans a time gap (consecutive
+        records not 1 s apart, §5.1; a leap-second record counts as one), a
+        change of sample rate, or a record shorter than 1 s: samples on
+        either side are not contiguous in time.
+        """
+        return _FileSamples(self)
+
+    @property
+    def timetags(self) -> _FileTimetags:
+        """
+        The time of every sample, ``datetime64[ns]``, indexed like ``samples``.
+
+        ``pf.timetags[a:b]`` are the times of ``pf.samples[a:b]``: sample
+        *k* of a record is at ``header.timetag + k / sample_rate``, rounded
+        to the nanosecond (exact when the rate divides 1e9).  The two terms
+        are rounded separately, so with sub-nanosecond picoseconds a time
+        can be 1 ns off the exactly rounded sum.  Header-only:
+        no samples are read.  A gap between records shows as a jump in the
+        times; unlike ``samples``, nothing is raised.  For one entry per
+        record (start epochs) use ``timetag_array``.
+
+        A leap-second record (SECOND OF DAY 86400) has the same
+        ``header.timetag`` as the next day's 00:00:00 (NumPy has no leap
+        seconds), so its sample times repeat the next record's.
+        """
+        return _FileTimetags(self)
+
+    # ---- timetag ------------------------------------------------------
+
+    @property
+    def timetag_array(self) -> np.ndarray:
+        """
+        Per-record start epochs (one entry per record, header-only).
+
+        Returns the time tag of each record -- its start epoch in station
+        time, an approximation to UTC (§5.2.5) -- as a
+        ``numpy.datetime64[ns]`` array of length ``len(self.records)``.
+        Header-only: no I/Q is decoded, so this stays cheap on a streamed or
+        multi-gigabyte product file.  For per-sample times use ``timetags``.
+
+        Returns
+        -------
+        np.ndarray
+            ``datetime64[ns]`` record start epochs, one per record.
+        """
+        return np.array(
+            [r.header.timetag for r in self.records], dtype="datetime64[ns]"
+        )
+
+    # ---- downconversion frequency -----------------------------------------
+
+    @property
+    def downconversion_frequency(self) -> _FileDownconversion:
+        """
+        Total downconversion frequency of every sample, Hz, indexed like ``samples``.
+
+        ``pf.downconversion_frequency[a:b]`` is the frequency at the times of
+        ``pf.samples[a:b]``: each record's §5.2.6 polynomial, ::
+
+            f = rf_to_if_downconv + if_to_channel_downconv
+                + c1 + 2·c2·t + 3·c3·t²
+
+        at ``t - t0 = ps*1e-12 - t0_offset + k/fs``, as
+        ``Record.downconversion_frequency``.  Header-only: no samples are
+        read.  For one value per record use
+        ``record_downconversion_frequency`` (at each first sample) or
+        ``mean_downconversion_frequency`` (over each second).  NaN for a
+        record whose c1, c2 and c3 are NaN (DSN 0222 Millisecond Predict).
+        """
+        return _FileDownconversion(self, _downconv_hz, "downconversion frequencies (Hz)")
+
+    @property
+    def record_downconversion_frequency(self) -> np.ndarray:
+        """
+        Per-record downconversion frequency at each record's first sample (header-only).
+
+        One value per record: the total downconversion frequency at the
+        record's first sample, ``tau = t - t0 = ps*1e-12 - t0_offset``,
+
+            f = F + c1 + 2·c2·tau + 3·c3·tau²   [Hz]
+
+        (§5.2.6), ``F = rf_to_if_downconv + if_to_channel_downconv``;
+        ``F + c1`` when tau = 0.  It is also the value the ``read_product``
+        / ``select`` downconversion filters compare, except for a record
+        whose c1, c2 and c3 are all NaN (DSN 0222 Millisecond Predict):
+        this array is NaN there, and the filters compare the fixed part
+        ``F``.  For the average over
+        the record use ``mean_downconversion_frequency``.
+        Header-only -- no I/Q decode -- so it is cheap on a streamed or large
+        product file.  For the per-sample frequency (including c2/c3
+        curvature) use ``downconversion_frequency``.
+
+        Returns
+        -------
+        np.ndarray
+            Downconversion frequency in Hz, one per record (empty if none).
+
+        References
+        ----------
+        CCSDS 506.1-B-1 (June 2013), §5.2.6 (downconversion: fixed plus variable frequency)
+        """
+        return np.array(
+            [_downconv_hz(r.header, _origin_offset(r.header, self._t0_offset)) for r in self.records],
+            dtype=np.float64,
+        )
+
+    @property
+    def mean_downconversion_frequency(self) -> np.ndarray:
+        """
+        Per-record mean downconversion frequency (header-only).
+
+        One value per record: the time average of the total downconversion
+        frequency over the record's span, from its first sample (``tau =
+        a = ps*1e-12 - t0_offset``) to one second later (``b = a +
+        1``, §5.1.1),
+
+            f = F + c1 + c2·(a + b) + c3·(a² + a·b + b²)   [Hz]
+
+        with ``F = rf_to_if_downconv + if_to_channel_downconv`` (§5.2.6.1);
+        ``F + c1 + c2 + c3`` when a = 0.  It is the phase advance over the
+        record per second, not the frequency at the midpoint (they differ
+        when c3 is nonzero).  Tag it at the span midpoint, timetag + 0.5 s.
+        NaN for a record whose c1, c2 and c3 are NaN.
+
+        Returns
+        -------
+        np.ndarray
+            Mean downconversion frequency in Hz, one per record (empty if none).
+        """
+        return np.array(
+            [_mean_downconv_hz(r.header, self._t0_offset) for r in self.records], dtype=np.float64
+        )
+
+    # ---- downconversion phase ---------------------------------------------
+
+    @property
+    def downconversion_phase(self) -> _FileDownconversion:
+        """
+        Variable-part downconversion phase of every sample, turns, indexed
+        like ``samples``.
+
+        ``pf.downconversion_phase[a:b]`` is the phase at the times of
+        ``pf.samples[a:b]``: each record's §5.2.6.2 polynomial
+
+            φ_variable = Φ + c0 + c1·t + c2·t² + c3·t³
+
+        at ``t - t0 = ps*1e-12 - t0_offset + k/fs``, as
+        ``Record.downconversion_phase``.  The fixed part is not included
+        (its epoch t_b is unknown, §5.2.6.1), so this phase is not the
+        integral of ``downconversion_frequency``, which is the total: its
+        derivative is that frequency minus ``rf_to_if_downconv +
+        if_to_channel_downconv``.  ``Φ`` (channel accumulated phase)
+        carries the phase from record to record; Table 5-1 says it "should
+        be continuous" across records, so a range across consecutive
+        records is continuous only when the producer keeps it so.
+        Header-only: no samples are read.  For one value per record (at each first sample) use
+        ``record_downconversion_phase``.
+        """
+        return _FileDownconversion(self, _downconv_phase, "downconversion phases (turns)")
+
+    @property
+    def record_downconversion_phase(self) -> np.ndarray:
+        """
+        Per-record variable-part downconversion phase at each record's
+        first sample (header-only; §5.2.6.2, fixed part not included).
+
+        One value per record: the downconversion phase at the record's
+        first sample, ``tau = t - t0 = ps*1e-12 - t0_offset``,
+
+            φ = Φ + c0 + c1·tau + c2·tau² + c3·tau³   [turns]
+
+        (§5.2.6), where ``Φ`` is the channel accumulated phase; ``Φ + c0``
+        when tau = 0.  Header-only -- no I/Q decode.
+
+        Returns
+        -------
+        np.ndarray
+            Downconversion phase in turns (cycles), one per record (empty if
+            none).
+
+        References
+        ----------
+        CCSDS 506.1-B-1 (June 2013), §5.2.6
+        """
+        return np.array(
+            [_downconv_phase(r.header, _origin_offset(r.header, self._t0_offset)) for r in self.records],
+            dtype=np.float64,
+        )
+
+    # ---- samples: load / release -----------------------------------------
+
+    def load(self, *, progress: bool = False) -> None:
+        """
+        Read every record's samples into memory and keep them.
+
+        One sequential pass with a single open handle per file.  Records
+        stay loaded until ``release()``.  Memory is the decoded samples of
+        every record -- several times the file size -- so for long high-rate
+        files prefer ``record.data`` one record at a time.
+
+        Parameters
+        ----------
+        progress : bool
+            Draw a progress bar on stderr (default False).
+        """
+        _load_records(self.records, progress=progress)
+
+    def release(self) -> None:
+        """Drop every record's loaded samples; access reads them from disk again."""
+        for rec in self.records:
+            rec.release()
+
+    # ---- copy ---------------------------------------------------------
+
+    def copy(self) -> ProductFile:
+        """Return a deep copy of the product file."""
+        pf = ProductFile()
+        pf.records = copy.deepcopy(self.records)
+        pf.name = self.name
+        pf.path = self.path
+        pf._set_read_settings(self._t0_offset, self._agency_layout)
+        return pf
+
+    # ---- text dump --------------------------------------------------------
+
+    def dump_headers(self, dest: str | Path | TextIO | None = None) -> None:
+        """
+        Dump all record headers as human-readable text.
+
+        Writes one block per record containing all scalar header fields
+        (reserved byte fields are shown as length summaries).
+
+        Parameters
+        ----------
+        dest : str, Path, text stream, or None
+            ``None`` (default) prints to the terminal (``sys.stdout``); a
+            path writes a new UTF-8 text file; an open text stream is
+            written to and left open.
+
+        Examples
+        --------
+        >>> pf.dump_headers()                 # terminal
+        >>> pf.dump_headers("headers.txt")    # file
+        """
+        _display.dump(self, dest, data=False)
+
+    def dump(self, dest: str | Path | TextIO | None = None) -> None:
+        """
+        Dump the full product file (headers + data) as text.
+
+        Writes header and I/Q data blocks interleaved in record order:
+        header, data, header, data, etc.  I/Q samples are written as
+        comma-separated ``I, Q`` pairs, one per line.
+
+        Parameters
+        ----------
+        dest : str, Path, text stream, or None
+            ``None`` (default) prints to the terminal (``sys.stdout``); a
+            path writes a new UTF-8 text file; an open text stream is
+            written to and left open.
+
+        Notes
+        -----
+        One line per sample, so a whole file can run to millions of lines;
+        to the terminal, dump a slice.
+
+        Examples
+        --------
+        >>> pf.slice(0, 1).dump()             # first record, terminal
+        >>> pf.dump("full_dump.txt")          # whole file, to a file
+        """
+        _display.dump(self, dest)

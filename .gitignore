@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+src/rdefpy/prd/unpack_cyth.c
+build/
+dist/
+wheelhouse/
+*.egg-info/
+.venv/
+.venv-*/
+.pytest_cache/
+.vscode/
+
+# Sphinx output
+docs/_build/
+docs/generated/

@@ -1,0 +1,75 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Build (Cython extension)
+        run: uv sync
+      - name: Check the Cython extension was built
+        run: uv run --no-sync python -c "from rdefpy.prd import reader; assert reader._unpack_fast is not None and reader._complex_fast is not None"
+      - name: Tests, Cython
+        run: uv run --no-sync python -m pytest -rs
+
+      # Same install with the compiled extension removed: the NumPy fallback
+      # must import and pass on its own.
+      - name: Remove the Cython extension
+        shell: bash
+        run: rm -f src/rdefpy/prd/unpack_cyth*.so src/rdefpy/prd/unpack_cyth*.pyd
+      - name: Check the extension is gone
+        run: uv run --no-sync python -c "from rdefpy.prd import reader; assert reader._unpack_fast is None and reader._complex_fast is None"
+      - name: Tests, NumPy only
+        run: uv run --no-sync python -m pytest -rs
+
+  # The documentation must build with no warnings (as on Read the Docs).
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
+        with:
+          python-version: "3.14"
+      - name: Build the docs
+        run: |
+          uv sync --group docs
+          uv run --no-sync python -m sphinx -W --keep-going -b html docs docs/_build/html
+
+  # What a user without a C compiler gets from the sdist: the extension build
+  # fails (CC=false), is skipped as optional, and the NumPy path is installed.
+  sdist-no-compiler:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
+        with:
+          python-version: "3.11"
+
+      - name: Build the sdist, then a wheel from it with no working compiler
+        shell: bash
+        run: |
+          uv build --sdist --out-dir dist
+          CC=false uv build --wheel --out-dir dist dist/*.tar.gz 2>&1 | tee build.log
+          grep -q 'building extension "rdefpy.prd.unpack_cyth" failed' build.log
+          if unzip -l dist/*.whl | grep '\.so'; then exit 1; fi
+      - name: Install the wheel in a fresh venv
+        run: |
+          uv venv nocc
+          uv pip install --python nocc dist/*.whl pytest
+      - name: Check the installed package has no extension
+        run: nocc/bin/python -c "import rdefpy; from rdefpy.prd import reader; assert 'site-packages' in rdefpy.__file__; assert reader._unpack_fast is None and reader._complex_fast is None"
+      - name: Tests, installed sdist, NumPy only
+        run: nocc/bin/python -m pytest -rs
