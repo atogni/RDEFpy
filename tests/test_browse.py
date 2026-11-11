@@ -92,7 +92,8 @@ def test_browse_window_blocks_and_buttons():
         tb.set_val("")
     sg = np.asarray(ax_res.images[0].get_array())
     assert ax.get_xlim() == (-1000, 1000) and ax_res.images[0].get_clim() == (np.nanmedian(sg), np.nanmax(sg))
-    assert cax.get_visible() and cax.get_ylim() == ax_res.images[0].get_clim() and len(fig.axes) == n_axes
+    assert cax.get_visible() and len(fig.axes) == n_axes
+    np.testing.assert_allclose(cax.get_ylim(), ax_res.images[0].get_clim(), rtol=1e-12)  # 1 ulp off on macOS arm64
 
     overlay = ax_res.lines[:2]  # carrier dots and rate dashes over the spectrogram
     assert cb.get_status() == [True] and all(ln.get_visible() for ln in overlay)
