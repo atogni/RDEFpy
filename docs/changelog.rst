@@ -1,6 +1,33 @@
 Changelog
 =========
 
+1.2.0 (2026-11-17)
+------------------
+
+Time-tag and t0_offset warnings on read, and a faster browser with a
+frequency-resolution box.
+
+Product files (§5)
+   * Reading warns (``RuntimeWarning``, once per kind) for time tags not
+     increasing, picoseconds differing between records, a year outside
+     1678-2261, day 366 of a non-leap year and second of day 86400, and
+     for a ``t0_offset`` of more than 1 s.
+   * ``info()``: new rows ``gaps`` and ``invalid_records``.
+
+Browsing
+   * ``browse``: the checkbox is now "Compute carrier": unticked,
+     ``extract_carrier`` is not run and no carrier is drawn, for faster
+     browsing.
+   * ``browse``: new "df [Hz]" box: spectrum and spectrogram resolution, by
+     averaging the power of consecutive 1/df-s segments (all samples used).
+     Blank: 1/T, as before.
+   * ``browse``: clearer title, legend ("carrier", "downconversion, variable
+     part") and y label in the top middle panel.
+
+Documentation
+   * Carrier extraction also cites Bertotti, Iess & Tortora (2003), the
+     original presentation of SPI.
+
 1.1.0 (2026-11-10)
 ------------------
 

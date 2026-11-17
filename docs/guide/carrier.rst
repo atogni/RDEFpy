@@ -41,7 +41,10 @@ no sample.
 The estimator is that of Togni, Zannoni and Tortora, "Accurate frequency
 estimation through iterative parabolic interpolations", *Signal Processing*
 237 (2025) 110094, https://doi.org/10.1016/j.sigpro.2025.110094. Cite it
-when you use the method (:doc:`/citing`). The per-block estimators are
+when you use the method (:doc:`/citing`). SPI interpolation was first
+presented in Bertotti, Iess and Tortora, "A test of general relativity
+using radio links with the Cassini spacecraft", *Nature* 425 (2003)
+374-376, https://doi.org/10.1038/nature01997. The per-block estimators are
 :func:`rdefpy.carrier.frft_frequency` and
 :func:`rdefpy.carrier.spi_frequency`.
 

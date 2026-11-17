@@ -23,6 +23,8 @@ Read a product file
         first_timetag: 2026-02-08T12:00:00.000000000Z
          last_timetag: 2026-02-08T12:00:01.000000000Z
           consecutive: True
+                 gaps: 0
+      invalid_records: 0
           sample_rate: 2,000 Hz
           sample_size: 16 bit
         spacecraft_id: 1

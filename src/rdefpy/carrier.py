@@ -22,6 +22,10 @@ References
 Togni, A., Zannoni, M., & Tortora, P. (2025). Accurate frequency
 estimation through iterative parabolic interpolations. Signal
 Processing, 237, 110094. https://doi.org/10.1016/j.sigpro.2025.110094
+
+Bertotti, B., Iess, L., & Tortora, P. (2003). A test of general relativity
+using radio links with the Cassini spacecraft. Nature, 425(6956), 374-376.
+https://doi.org/10.1038/nature01997 (original presentation of SPI)
 """
 
 import ctypes

@@ -23,7 +23,7 @@ def test_browse_window_blocks_and_buttons():
     fig = browse(pf)  # middle of the first record, T = 1 s
     ax, ax_sky, ax_res, ax_txt = fig.axes[:4]
     (tb_epoch, tb_T, tb_n, b_prev, b_next, tb_pad, b_win, tb_fmin, tb_fmax, tb_pmin, tb_pmax,
-     tb_sfmin, tb_sfmax, tb_spmin, tb_spmax, cb, *opts) = fig._rdefpy_widgets
+     tb_sfmin, tb_sfmax, tb_spmin, tb_spmax, cb, *opts, tb_df) = fig._rdefpy_widgets
     assert tb_epoch.text == _fmt(t0).split(".")[0] + ".5"  # no trailing zeros
     assert "T = 1 s" in ax.get_title() and len(ax.lines) == 2  # spectrum + peak dot
     c = extract_carrier(pf, 1.0, zero_padding=1)[0]  # the window = the first 1-s block
@@ -95,15 +95,15 @@ def test_browse_window_blocks_and_buttons():
     assert cax.get_visible() and len(fig.axes) == n_axes
     np.testing.assert_allclose(cax.get_ylim(), ax_res.images[0].get_clim(), rtol=1e-12)  # 1 ulp off on macOS arm64
 
-    overlay = ax_res.lines[:2]  # carrier dots and rate dashes over the spectrogram
-    assert cb.get_status() == [True] and all(ln.get_visible() for ln in overlay)
-    cb.set_active(0)  # untick: hidden
-    assert not any(ln.get_visible() for ln in overlay) and all(ln.get_visible() for ln in ax_res.lines[2:])
+    n_res = len(ax_res.lines)  # carrier dots and rate dashes, then the window lines
+    assert cb.get_status() == [True] and len(ax_sky.lines) == 2 and len(ax.lines) == 2
+    cb.set_active(0)  # untick: no carrier anywhere
+    assert len(ax_res.lines) == n_res - 2 and not ax_sky.lines and len(ax.lines) == 1
     b_next._observers.process("clicked", None)  # one T forward
     assert tb_epoch.text.endswith(":01.25")
-    assert not any(ln.get_visible() for ln in ax_res.lines[:2])  # still hidden after a redraw
+    assert len(ax_res.lines) == n_res - 2 and not ax_sky.lines  # still off after a redraw
     cb.set_active(0)
-    assert all(ln.get_visible() for ln in ax_res.lines[:2])
+    assert len(ax_res.lines) == n_res and len(ax_sky.lines) == 2
 
     from matplotlib.backend_bases import MouseEvent
 
@@ -138,6 +138,10 @@ def test_browse_carrier_padding_and_cache(monkeypatch):
     tb_pad.set_val("2")  # pad-2 blocks were freed: computed again
     new = calls[6:]
     assert set(new[: new.index(2)]) == {3} and new.count(2) >= 3  # all 3 pad-2 blocks recomputed
+    n = len(calls)
+    fig._rdefpy_widgets[15].set_active(0)  # untick "Compute carrier"
+    tb_pad.set_val("4")
+    assert len(calls) == n  # not computed
     plt.close(fig)
 
 
@@ -148,7 +152,7 @@ def test_browse_tab_moves_between_cells():
     pf = read_product(REF)
     fig = browse(pf)
     w = fig._rdefpy_widgets
-    order = [w[i] for i in (0, 1, 2, 5, 11, 12, 13, 14, 7, 8, 9, 10)]  # epoch, T, blocks, pad, Spectrogram, Periodogram
+    order = [w[i] for i in (0, 1, 2, 5, -1, 11, 12, 13, 14, 7, 8, 9, 10)]  # epoch, T, blocks, pad, df, Spectrogram, Periodogram
     press = lambda key: KeyEvent("key_press_event", fig.canvas, key)._process()
     typing = lambda: [tb for tb in order if tb.capturekeystrokes]
     epoch0 = order[0].text
@@ -262,7 +266,7 @@ def test_spectrum_is_the_periodogram_of_the_samples_as_recorded(write_prd):
     pf = read_product(write_prd(*(_tone_record(s) for s in range(3))))
     fig = _no_render(browse(pf, blocks=0))
     ax, w = fig.axes[0], fig._rdefpy_widgets
-    tb_pad, b_win, opts = w[5], w[6], w[16:]
+    tb_pad, b_win, opts, tb_df = w[5], w[6], w[16:-1], w[-1]
     x = pf.samples[:FS]  # the window: all of record 0
     assert abs(x.mean() - (1 + 1j)) < 0.1  # the tone averages out; the code offset does not
 
@@ -296,6 +300,20 @@ def test_spectrum_is_the_periodogram_of_the_samples_as_recorded(write_prd):
     np.testing.assert_array_equal(f, np.arange(-2 * FS, 2 * FS) / 4)
     np.testing.assert_allclose(db, want(_WINDOWS[name](FS), 4), rtol=0, atol=1e-9)
     assert "max of every" not in ax.get_title()
+
+    tb_pad.set_val("1")
+    tb_df.set_val("10")  # 10 segments of 0.1 s, power averaged, every sample used
+    f, db = drawn()
+    win = _WINDOWS[name](FS // 10)
+    p = np.fft.fftshift(np.mean(np.abs(np.fft.fft(x.reshape(-1, FS // 10) * win)) ** 2, 0)) / win.sum() ** 2
+    np.testing.assert_array_equal(f, np.arange(-FS // 2, FS // 2, 10))
+    np.testing.assert_allclose(db, 10 * np.log10(np.maximum(p, np.finfo(float).tiny)), rtol=0, atol=1e-9)
+    assert ax.get_title().endswith("df = 10 Hz, mean of 10")
+    np.testing.assert_array_equal(ax.lines[1].get_xydata(), dot)  # carrier: still the whole window
+    tb_df.set_val("3")  # 1/3 s: not whole samples
+    assert "1/df" in ax.get_title()
+    tb_df.set_val("")  # blank: 1/T again
+    np.testing.assert_array_equal(drawn()[0], np.arange(-FS // 2, FS // 2))
     plt.close(fig)
 
 

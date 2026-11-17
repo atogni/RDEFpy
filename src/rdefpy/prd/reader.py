@@ -545,6 +545,11 @@ def read_headers(
         Once per read, if *t0_offset* is not passed and a record's
         picoseconds exceed DSN 0222's 100,000 (Table 3-1): the polynomial
         coefficients may refer to another origin.
+    RuntimeWarning
+        Once per kind, for time tags that are legal but suspicious: not
+        increasing, picoseconds differing between records, a year outside
+        1678-2261 (no ``timetag``), day 366 of a non-leap year, second of
+        day 86400; and for a *t0_offset* of more than 1 s.
     """
     path = Path(path)
     offset = 0.0 if t0_offset is None else _check_t0_offset(t0_offset)
@@ -583,6 +588,7 @@ def read_headers(
         _warn_picoseconds(pf)
 
     pf._check_constant_fields()
+    pf._check_time_tags()
 
     return pf
 
@@ -703,6 +709,11 @@ def read_product(
         Once per read, if *t0_offset* is not passed and a record's
         picoseconds exceed DSN 0222's 100,000 (Table 3-1): the polynomial
         coefficients may refer to another origin.
+    RuntimeWarning
+        Once per kind, for time tags that are legal but suspicious: not
+        increasing, picoseconds differing between records, a year outside
+        1678-2261 (no ``timetag``), day 366 of a non-leap year, second of
+        day 86400; and for a *t0_offset* of more than 1 s.
 
     Examples
     --------
@@ -775,6 +786,7 @@ def read_product(
         _warn_picoseconds(pf)
 
     pf._check_constant_fields()
+    pf._check_time_tags()
 
     return pf
 

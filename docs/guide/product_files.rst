@@ -38,6 +38,8 @@ their times, :doc:`downconversion` for the downconversion, and
         first_timetag: 2026-02-08T12:00:00.000000000Z
          last_timetag: 2026-02-08T12:00:01.000000000Z
           consecutive: True
+                 gaps: 0
+      invalid_records: 0
           sample_rate: 2,000 Hz
           sample_size: 16 bit
         spacecraft_id: 1
@@ -48,7 +50,9 @@ their times, :doc:`downconversion` for the downconversion, and
    2026-02-08T12:00:01.000000000 2000 96.32945284169084
    1 2 (2, True)
 
-``consecutive`` is True when the records are 1 s apart (within 1 µs). ``band``
+``consecutive`` is True when the records are 1 s apart (within 1 µs);
+``gaps`` counts the steps that are not, with the largest, and
+``invalid_records`` the records with a nonzero ``validity_flag``. ``band``
 classifies the fixed downconversion into the nominal S, X and Ka downlink
 allocations, or ``unknown``.
 
@@ -264,5 +268,15 @@ A :class:`RuntimeWarning` is raised when station, spacecraft, agency,
 version, sample size, sample rate or a fixed downconversion frequency varies
 between records.
 
-Not checked: time order and spacing of the records (``info()`` reports
-``consecutive``), and the file name against the contents.
+A :class:`RuntimeWarning`, once per kind and read, for time tags that are
+legal but suspicious, the records read as is:
+
+* a record not after the one before it (duplicate or out of order);
+* picoseconds that differ between records (not one sub-second grid);
+* a year outside 1678-2261: the record has no ``timetag`` and time windows
+  skip it;
+* day 366 of a non-leap year, or second of day 86400 (leap second);
+* a ``t0_offset`` of more than 1 s (likely not in seconds).
+
+Not checked: gaps between records (``info()`` reports ``consecutive`` and
+``gaps``), and the file name against the contents.

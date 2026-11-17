@@ -1003,7 +1003,8 @@ def test_summaries_render():
     assert _rows(pf) == {
         "path": str(PRD_16.resolve()), "records": "2",
         "first_timetag": "2026-02-08T12:00:00.000000000Z", "last_timetag": "2026-02-08T12:00:01.000000000Z",
-        "consecutive": "True", "sample_rate": "2,000 Hz", "sample_size": "16 bit", "spacecraft_id": "1",
+        "consecutive": "True", "gaps": "0", "invalid_records": "0",
+        "sample_rate": "2,000 Hz", "sample_size": "16 bit", "spacecraft_id": "1",
         "station_id": "24", "band": "X", "frequency_steering": "False",
     }
     assert _rows(pf[1]) == {

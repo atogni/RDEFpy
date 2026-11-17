@@ -104,12 +104,15 @@ def browse(pf, epoch=None, integration_time: float = 1.0, blocks: int = 5):
 
     Boxes at the bottom: centre epoch (time scale of the record time tags,
     e.g. ``2026-02-08T12:00:00.5``), integration time T [s] (sub-second or
-    longer than a record; ``T * sample_rate`` must be whole), carrier blocks
+    longer than a record; ``T * sample_rate`` must be whole), df [Hz] (blank:
+    1/T; else the spectrum and spectrogram average the power of consecutive
+    1/df-s segments, all samples used; the carrier is unaffected), carrier blocks
     on each side, zero-padding factor (integer 1 to 10), spectrum window, and two groups of
     frequency min / max [Hz] and power min / max [dB] cells: "Periodogram"
     (spectrum axes; blank: +- Nyquist, auto) and "Spectrogram" (its
     frequency axis and colour range; blank: +- Nyquist, median to max dB).
-    A checkbox shows or hides the carrier estimates on the spectrogram. The arrow
+    A "Compute carrier" checkbox: unticked, ``extract_carrier`` is not run and
+    no carrier is drawn (spectrum dot, middle panels), for faster browsing. The arrow
     buttons (or the left and right arrow keys) move the epoch by T. While
     typing, Tab / Shift+Tab apply the cell and move to the next / previous one.
     The values under the mouse show above the boxes; the mouse wheel or the
@@ -204,6 +207,7 @@ def browse(pf, epoch=None, integration_time: float = 1.0, blocks: int = 5):
         tb_T = TextBox(fig.add_axes((0.36, row1, 0.05, 0.04)), "T [s] ", initial=f"{integration_time:g}", **tbox)
         tb_n = TextBox(fig.add_axes((0.53, row1, 0.03, 0.04)), "Blocks each side ", initial=str(blocks), **tbox)
         tb_pad = TextBox(fig.add_axes((0.08, row2, 0.03, 0.04)), "Zero pad x ", initial="1", **tbox)
+        tb_df = TextBox(fig.add_axes((0.08, row0, 0.05, 0.04)), "df [Hz] ", initial="", **tbox)
         b_win = Button(fig.add_axes((0.13, row2, 0.11, 0.04)), "Window: none ▾", **box)
         opts = [Button(fig.add_axes((0.13, row2 + 0.04 + 0.035 * i, 0.11, 0.035)), name, color="0.25",
                        hovercolor="0.4") for i, name in enumerate(_WINDOWS)]  # drop-down, hidden until opened
@@ -214,12 +218,11 @@ def browse(pf, epoch=None, integration_time: float = 1.0, blocks: int = 5):
                       for x, label in ((0.375, "f min [Hz] "), (0.47, "f max [Hz] "), (0.565, "P min [dB] "),
                                        (0.66, "P max [dB] "))]
         tb_fmin, tb_fmax, tb_pmin, tb_pmax, tb_sfmin, tb_sfmax, tb_spmin, tb_spmax = cells
-        cb = CheckButtons(fig.add_axes((0.57, row1, 0.13, 0.04)), ["Carrier on spectrogram"], [True],
+        cb = CheckButtons(fig.add_axes((0.57, row1, 0.13, 0.04)), ["Compute carrier"], [True],
                           label_props=dict(fontsize=[9]), frame_props=dict(edgecolor="white", facecolor="0.15", s=[80]),
                           check_props=dict(facecolor="white", s=[80]))
         cb.ax.set_facecolor("0.15")
-    boxes = (tb_epoch, tb_T, tb_n, tb_pad, *cells)
-    overlay = []  # carrier estimates drawn over the spectrogram; the checkbox shows / hides them
+    boxes = (tb_epoch, tb_T, tb_n, tb_pad, tb_df, *cells)
 
     def message(a, text):
         a.set_title(text, color="tomato", fontsize=9)
@@ -228,10 +231,12 @@ def browse(pf, epoch=None, integration_time: float = 1.0, blocks: int = 5):
     def parse():
         mid = np.datetime64(tb_epoch.text.strip().rstrip("Z"), "ns")
         T, n_side, pad = float(tb_T.text), int(tb_n.text), int(tb_pad.text)
+        df = float(tb_df.text) if tb_df.text.strip() else None  # blank: 1/T, one segment
         # NaT, inf and counts beyond int64 ns would raise or wrap in the time arithmetic
-        if np.isnat(mid) or not 0 < T * 1e9 < 2**63 or not 0 <= n_side < 2**63 or not 1 <= pad <= 10:
+        if (np.isnat(mid) or not 0 < T * 1e9 < 2**63 or not 0 <= n_side < 2**63 or not 1 <= pad <= 10
+                or df is not None and not 0 < df < np.inf):
             raise ValueError
-        return (mid, T, n_side, pad) + tuple(_limits(lo.text, hi.text) for lo, hi in zip(cells[::2], cells[1::2]))
+        return (mid, T, n_side, pad, df) + tuple(_limits(lo.text, hi.text) for lo, hi in zip(cells[::2], cells[1::2]))
 
     def clear():
         for a in (ax, ax_sky, ax_res, ax_txt):
@@ -310,21 +315,28 @@ def browse(pf, epoch=None, integration_time: float = 1.0, blocks: int = 5):
         recs = [cached(("rec", t), r.read_samples) for r, t in zip(sub, tags)]  # each record decoded once
         return np.concatenate(recs)[i0 : i0 + round(T * fs)], fs
 
-    def spectrum(a, T, pad):
-        """dB spectrum of the samples in [a, a + T), max-pooled to _MAX_POINTS: (dB, f, k, n, fs)."""
+    def spectrum(a, T, pad, df):
+        """dB spectrum of the samples in [a, a + T), max-pooled to _MAX_POINTS: (dB, f, k, n, fs, segments).
+
+        df (Hz, None: 1/T): power averaged over consecutive segments of 1/df s (Bartlett), all samples used."""
         def make():
             x, fs = samples(a, T)
-            w = _WINDOWS[win["name"]](len(x))  # display only
-            p = np.fft.fftshift(np.abs(np.fft.fft(x * w, pad * len(x))) ** 2) / np.sum(w) ** 2
+            m = len(x) if df is None else round(fs / df)  # samples per segment
+            if df is not None and (m < 1 or abs(fs / df - m) > 1e-9 * m):
+                raise ValueError(f"1/df must be a whole number of samples ({fs:g} Hz)")
+            if len(x) % m:
+                raise ValueError(f"1/df = {m / fs:g} s must divide T")
+            w = _WINDOWS[win["name"]](m)  # display only, on each segment
+            p = np.fft.fftshift(np.mean(np.abs(np.fft.fft(x.reshape(-1, m) * w, pad * m)) ** 2, axis=0)) / np.sum(w) ** 2
             f = np.fft.fftshift(np.fft.fftfreq(len(p), 1 / fs))
             k = -(-len(p) // _MAX_POINTS)
             if k > 1:  # display only: max of each group of k bins
-                m = len(p) // k * k
-                pg, fg, r = p[:m].reshape(-1, k), f[:m].reshape(-1, k), np.arange(m // k)
+                g = len(p) // k * k
+                pg, fg, r = p[:g].reshape(-1, k), f[:g].reshape(-1, k), np.arange(g // k)
                 i = pg.argmax(1)  # each group's peak bin, at its own frequency
                 p, f = pg[r, i], fg[r, i]
-            return 10 * np.log10(np.maximum(p, np.finfo(float).tiny)), f, k, len(x), fs
-        return cached(("spec", a, T, pad, win["name"]), make)
+            return 10 * np.log10(np.maximum(p, np.finfo(float).tiny)), f, k, len(x), fs, len(x) // m
+        return cached(("spec", a, T, pad, df, win["name"]), make)
 
     def carrier(a, T, pad):
         """extract_carrier on [a, a + T): samples as recorded, never windowed; zero padding = the box."""
@@ -340,24 +352,27 @@ def browse(pf, epoch=None, integration_time: float = 1.0, blocks: int = 5):
 
     def _show():
         try:
-            mid, T, n_side, pad, (fmin, fmax), (pmin, pmax), (sfmin, sfmax), (spmin, spmax) = parse()
+            mid, T, n_side, pad, df, (fmin, fmax), (pmin, pmax), (sfmin, sfmax), (spmin, spmax) = parse()
         except ValueError:
             return message(ax, _BAD_INPUT)
         half = np.timedelta64(round(T * 5e8), "ns")
         a, b = mid - half, mid + half
         try:
             sub, tags, fs = touched(a, T)
-            db, f, k, n, fs = spectrum(a, T, pad)
+            db, f, k, n, fs, nseg = spectrum(a, T, pad, df)
         except ValueError as e:
             return message(ax, str(e))
         title = f"{_fmt(mid)}   T = {T:g} s   ({n} samples)"
+        if nseg > 1:
+            title += f"   df = {df:g} Hz, mean of {nseg}"
         if k > 1:
             title += f"   max of every {k} bins"
         ax.plot(f, db, lw=0.7, color="deepskyblue")
         ax.set(title=title, xlabel="Frequency from channel centre [Hz]", ylabel="Power [dB]")
         lims = [(-fs / 2 if fmin is None else fmin, fs / 2 if fmax is None else fmax)]  # blank: automatic; set at the end
-        cw = carrier(a, T, pad)[0]  # this window's extract_carrier row
-        if np.isfinite(cw["frequency"]):  # transparent dot at the carrier, with its values
+        on = cb.get_status()[0]  # "Compute carrier": unticked, extract_carrier is not run
+        cw = carrier(a, T, pad)[0] if on else None  # this window's extract_carrier row
+        if on and np.isfinite(cw["frequency"]):  # transparent dot at the carrier, with its values
             def amp():  # |mean of the samples dechirped at the carrier|: unwindowed, same scale as the spectrum
                 x, fs_ = samples(a, T)
                 u = np.arange(len(x)) / fs_ - T / 2  # from the block midpoint, where frequency is tagged
@@ -390,20 +405,24 @@ def browse(pf, epoch=None, integration_time: float = 1.0, blocks: int = 5):
         start = a - min(n_side, int((a - first) / Tns)) * Tns
         stop = b + min(n_side, (last - b) // Tns) * Tns
         starts = [start + i * Tns for i in range((stop - start) // Tns)]
-        c = np.concatenate([carrier(s, T, pad) for s in starts])
-        t = (c["time"] - mid) / np.timedelta64(1, "ns") / 1e9
-        h = sub[0].header
-        fixed = float(h.rf_to_if_downconv) + float(h.if_to_channel_downconv)  # f_DC,fixed (§5.2.6.1)
-        ax_sky.plot(t, c["frequency_before_downconversion"] - fixed, "o-", ms=3, color="gold", label="before downconversion")
-        ax_sky.plot(t, c["downconversion_frequency"] - fixed, "s--", ms=3, color="violet", label="f_DC,variable")
-        ax_sky.set_title(f"Minus f_DC,fixed = {fixed:,.0f} Hz", fontsize=9)
-        ax_sky.set_ylabel("Hz")
-        ax_sky.legend(fontsize=7)
+        t = np.array([(s + half - mid) / np.timedelta64(1, "ns") / 1e9 for s in starts])  # block midpoints
+        if on:
+            c = np.concatenate([carrier(s, T, pad) for s in starts])
+            h = sub[0].header
+            fixed = float(h.rf_to_if_downconv) + float(h.if_to_channel_downconv)  # f_DC,fixed (§5.2.6.1)
+            ax_sky.plot(t, c["frequency_before_downconversion"] - fixed, "o-", ms=3, color="gold", label="carrier")
+            ax_sky.plot(t, c["downconversion_frequency"] - fixed, "s--", ms=3, color="violet",
+                        label="downconversion,\nvariable part")
+            ax_sky.set_title(f"Before downconversion, minus\nf_DC,fixed = {fixed:,.0f} Hz", fontsize=9)
+            ax_sky.legend(fontsize=7)
+        else:
+            ax_sky.set_title("Carrier not computed", fontsize=9)
+        ax_sky.set_ylabel("f − f_DC,fixed [Hz]")
         # Spectrogram of the same blocks (same T, zero pad, window), carrier on top.
         cols = []
         for s in starts:
             try:
-                cols.append(spectrum(s, T, pad)[0])
+                cols.append(spectrum(s, T, pad, df)[0])
             except ValueError:  # block over a gap: blank column
                 cols.append(np.full(len(f), np.nan))
         sg = np.array(cols).T
@@ -423,11 +442,10 @@ def browse(pf, epoch=None, integration_time: float = 1.0, blocks: int = 5):
         # marker: frequency at the block midpoint; dashes either side, clear of it: the FrFT rate
         halo = [Stroke(linewidth=3, foreground="white"), Normal()]
         dt = np.array([-0.42, -0.12, np.nan, 0.12, 0.42, np.nan]) * T
-        overlay[:] = (ax_res.plot(t, c["frequency"], "o", ms=4, color="black", path_effects=halo)
-                      + ax_res.plot((t[:, None] + dt).ravel(), (c["frequency"][:, None] + c["rate"][:, None] * dt).ravel(),
-                                    lw=1.2, color="black", path_effects=halo))
-        for ln in overlay:
-            ln.set_visible(cb.get_status()[0])
+        if on:
+            ax_res.plot(t, c["frequency"], "o", ms=4, color="black", path_effects=halo)
+            ax_res.plot((t[:, None] + dt).ravel(), (c["frequency"][:, None] + c["rate"][:, None] * dt).ravel(),
+                        lw=1.2, color="black", path_effects=halo)
         ax_res.set_ylim(lims[2])
         ax_res.set_title("Baseband (after downconversion)", fontsize=9)
         ax_res.set(xlabel="s from epoch", ylabel="Hz")
@@ -457,7 +475,7 @@ def browse(pf, epoch=None, integration_time: float = 1.0, blocks: int = 5):
         menu(False)
         show()
 
-    tab_order = (tb_epoch, tb_T, tb_n, tb_pad, tb_sfmin, tb_sfmax, tb_spmin, tb_spmax,
+    tab_order = (tb_epoch, tb_T, tb_n, tb_pad, tb_df, tb_sfmin, tb_sfmax, tb_spmin, tb_spmax,
                  tb_fmin, tb_fmax, tb_pmin, tb_pmax)
 
     def tab(event):
@@ -498,12 +516,7 @@ def browse(pf, epoch=None, integration_time: float = 1.0, blocks: int = 5):
     for b in opts:
         b.on_clicked(lambda _, name=b.label.get_text(): pick(name))
 
-    def toggle(_):  # no recompute: the overlay is only hidden; redraws read the box
-        for ln in overlay:
-            ln.set_visible(cb.get_status()[0])
-        fig.canvas.draw_idle()
-
-    cb.on_clicked(toggle)
+    cb.on_clicked(show)  # redraw with or without the carrier; computed blocks stay cached
     menu(False)
     fig.canvas.mpl_connect("key_press_event", on_key)
     if hasattr(fig.canvas, "get_tk_widget"):  # Tk's default Tab moves keyboard focus off the canvas: stop it
@@ -577,8 +590,8 @@ def browse(pf, epoch=None, integration_time: float = 1.0, blocks: int = 5):
     fig.canvas.mpl_connect("scroll_event", on_scroll)
     fig.canvas.mpl_connect("resize_event", show)  # header pixels are sized to the panel
     # keep alive. Order: epoch, T, blocks, prev, next, zero pad, window, Periodogram f min, f max, P min, P max,
-    # Spectrogram f min, f max, P min, P max, carrier checkbox, then the window options (index 16 on)
-    fig._rdefpy_widgets = (tb_epoch, tb_T, tb_n, b_prev, b_next, tb_pad, b_win, *cells, cb, *opts)
+    # Spectrogram f min, f max, P min, P max, carrier checkbox, the window options (index 16 on), df (last)
+    fig._rdefpy_widgets = (tb_epoch, tb_T, tb_n, b_prev, b_next, tb_pad, b_win, *cells, cb, *opts, tb_df)
     show()
     win_ = getattr(fig.canvas.manager, "window", None)  # fill the screen: a 17-inch figure is wider than most
     for maximize in (lambda: win_.state("zoomed"), lambda: win_.showMaximized()):  # Tk (Windows), Qt

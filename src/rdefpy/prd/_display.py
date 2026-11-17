@@ -334,7 +334,7 @@ def product_str(pf: ProductFile) -> str:
         return ", ".join(f"{fmt(v)} ({c:,} rec)" for v, c in counts.items())
 
     if tt is None:
-        first = last = consecutive = "?"
+        first = last = consecutive = gaps = "?"
     else:
         first = _fmt_timetag(headers[int(np.argmin(tt))])
         last = _fmt_timetag(headers[int(np.argmax(tt))])
@@ -345,6 +345,8 @@ def product_str(pf: ProductFile) -> str:
             consecutive = "True"
         else:
             consecutive = f"False (min dt {dt_sec.min():.6f} s, max dt {dt_sec.max():.6f} s)"
+        gap = np.abs(dt_sec - 1.0) > 1e-6
+        gaps = f"{int(gap.sum()):,}" + (f" (largest dt {dt_sec[gap].max():.6f} s)" if gap.any() else "")
 
     # Steering across the file: curvature in any record, or c1 changing.
     try:
@@ -360,6 +362,8 @@ def product_str(pf: ProductFile) -> str:
         ("first_timetag", first),
         ("last_timetag", last),
         ("consecutive", consecutive),
+        ("gaps", gaps),
+        ("invalid_records", f"{sum(1 for h in headers if h.validity_flag):,}"),
         ("sample_rate", _one([h.sample_rate for h in headers], _fmt_rate)),
         ("sample_size", _one([h.sample_size for h in headers], _fmt_size)),
         ("spacecraft_id", _one([h.spacecraft_id for h in headers], _fmt_id)),

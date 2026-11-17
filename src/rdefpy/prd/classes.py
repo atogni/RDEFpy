@@ -28,6 +28,7 @@ correct samples with correct time tags.
 
 from __future__ import annotations
 
+import calendar
 import copy
 import math
 import numbers
@@ -116,12 +117,23 @@ def _phase_terms(header: RecordHeader) -> tuple[float, ...]:
 
 
 def _check_t0_offset(t0_offset) -> float:
-    """*t0_offset* as a float if it is a finite real number, else ``ValueError``."""
+    """
+    *t0_offset* as a float if it is a finite real number, else ``ValueError``.
+    More than 1 s warns: the useful values are 0 to 1 s, so a larger one is
+    likely in other units (picoseconds, milliseconds).
+    """
     if isinstance(t0_offset, bool | np.bool_) or not isinstance(t0_offset, numbers.Real):
         raise ValueError(f"t0_offset must be a finite number of seconds, got {t0_offset!r}")
     value = float(t0_offset)
     if not math.isfinite(value):
         raise ValueError(f"t0_offset must be a finite number of seconds, got {t0_offset!r}")
+    if abs(value) > 1.0:
+        warnings.warn(
+            f"t0_offset {value!r} s is more than 1 s from TIME TAG SECOND OF DAY: "
+            "t0_offset is in seconds (picoseconds * 1e-12 for the first sample)",
+            RuntimeWarning,
+            stacklevel=_user_stacklevel(),
+        )
     return value
 
 
@@ -1578,6 +1590,9 @@ class ProductFile:
           A leap-second record (SECOND OF DAY 86400) shows as a duplicate
           time here, so ``consecutive`` reads False across it; see
           ``RecordHeader.timetag``.
+        * ``gaps`` -- the number of steps between consecutive records that
+          are not 1 s (within 1 µs), and the largest such step.
+        * ``invalid_records`` -- records with a nonzero ``validity_flag``.
         * ``band`` -- each record's fixed downconversion
           (``rf_to_if + if_to_channel``) classified into the nominal DSN
           S/X/Ka allocations; ``unknown`` if it matches none.
@@ -1655,6 +1670,44 @@ class ProductFile:
                 RuntimeWarning,
                 stacklevel=_user_stacklevel(),
             )
+
+    def _check_time_tags(self) -> None:
+        """
+        Warn, once per kind, about time tags that are legal but suspicious:
+        not increasing, picoseconds differing between records, a year
+        without a ``timetag``, day 366 of a non-leap year, a leap second.
+        """
+        tags = [
+            (h.time_tag_year, h.time_tag_doy, h.time_tag_second_of_day,
+             h.time_tag_picoseconds_of_the_second)
+            for h in (r.header for r in self.records)
+        ]
+        tags = [t for t in tags if None not in t]
+        notes = []
+        n = sum(1 for a, b in zip(tags, tags[1:]) if b <= a)
+        if n:
+            notes.append(f"{n} record(s) not after the previous one (duplicate or out of order)")
+        ps = {_same_key(t[3]) for t in tags}
+        if len(ps) > 1:
+            notes.append(
+                f"time_tag_picoseconds_of_the_second takes {len(ps)} values: "
+                "the records are not on one sub-second grid"
+            )
+        n = sum(1 for t in tags if not 1678 <= t[0] <= 2261)
+        if n:
+            notes.append(
+                f"{n} record(s) with time_tag_year outside 1678-2261 have no timetag "
+                "(datetime64[ns] range); time windows skip them"
+            )
+        n = sum(1 for t in tags if t[1] == 366 and not calendar.isleap(t[0]))
+        if n:
+            notes.append(f"{n} record(s) on day 366 of a non-leap year: timetag is 1 January next year")
+        n = sum(1 for t in tags if t[2] == 86400)
+        if n:
+            notes.append(f"{n} record(s) at second of day 86400 (leap second): "
+                         "timetag is second 0 of the next day")
+        for note in notes:
+            warnings.warn(f"Time tags: {note}.", RuntimeWarning, stacklevel=_user_stacklevel())
 
     # ---- concatenation ------------------------------------------------
 

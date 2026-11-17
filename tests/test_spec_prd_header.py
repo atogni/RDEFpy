@@ -404,7 +404,7 @@ def test_negative_zero_is_read_as_zero_and_reported_once(field, write_prd):
         warnings.simplefilter("default")
         pf = read_product(path)
     assert all(math.copysign(1.0, getattr(r.header, field)) == 1.0 for r in pf.records)
-    (w,) = caught
+    (w,) = [w for w in caught if w.category is UserWarning]  # not the time-tag advisories
     assert f"{field}: -0.0" in str(w.message) and os.path.samefile(w.filename, __file__)
 
 
@@ -413,13 +413,13 @@ def test_out_of_range_reported_once_even_if_value_varies(write_prd):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("default")
         read_product(path)
-    (w,) = caught
+    (w,) = [w for w in caught if w.category is UserWarning]  # not the time-tag advisories
     assert "time_tag_picoseconds" in str(w.message)
 
 
 IN_RANGE = {
     "doy 1": dict(time_tag_doy=1),
-    "doy 366": dict(time_tag_doy=366),
+    "doy 366": dict(time_tag_year=2024, time_tag_doy=366),  # leap year: no calendar advisory
     "sod 0": dict(time_tag_second_of_day=0),
     "sod 86400": dict(time_tag_second_of_day=86400),
     "picoseconds 1e12 - 1": dict(time_tag_picoseconds_of_the_second=1e12 - 1),
@@ -435,6 +435,7 @@ def test_in_range_boundaries_are_silent(overrides, write_prd, capsys):
         # t0_offset passed: picoseconds 1e12 - 1 is in Table 5-1's range but
         # above DSN 0222's, which would get a separate advisory warning.
         read_product(write_prd(_zero_record(**overrides)), t0_offset=0.0)
+    caught = [w for w in caught if "leap second" not in str(w.message)]  # advisory, not a range report
     assert _reported(capsys, caught) == ""
 
 
@@ -814,6 +815,48 @@ def test_no_picosecond_warning_within_range_or_with_t0_offset(ps, t0_offset, wri
         warnings.simplefilter("error")
         read_product(path, t0_offset=t0_offset)
         read_headers(path, t0_offset=t0_offset)
+
+
+TIME_TAG_ADVISORIES = {
+    "duplicate": ([dict(), dict()], "not after the previous one"),
+    "out of order": ([dict(time_tag_second_of_day=43201), dict()], "not after the previous one"),
+    "picoseconds differ": ([dict(), dict(time_tag_second_of_day=43201, time_tag_picoseconds_of_the_second=5e5)],
+                           "not on one sub-second grid"),
+    "year 1600": ([dict(time_tag_year=1600)], "outside 1678-2261 have no timetag"),
+    "doy 366 non-leap": ([dict(time_tag_doy=366)], "day 366 of a non-leap year"),
+    "sod 86400": ([dict(time_tag_second_of_day=86400)], "leap second"),
+}
+
+
+@pytest.mark.parametrize("records, match", TIME_TAG_ADVISORIES.values(), ids=TIME_TAG_ADVISORIES.keys())
+def test_time_tag_advisories_warn_once_per_read(records, match, write_prd):
+    """Legal but suspicious time tags: one RuntimeWarning per kind, records read as is."""
+    path = write_prd(*[_zero_record(**r) for r in records * 2])  # each kind twice: still one warning
+    for read in (read_product, read_headers):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            pf = read(path, t0_offset=0.0)
+        mine = [w for w in caught if match in str(w.message)]
+        assert len(pf.records) == 2 * len(records) and len(mine) == 1
+        assert mine[0].category is RuntimeWarning
+
+
+@pytest.mark.parametrize("t0_offset, warns", [(1.0, False), (-1.0, False), (1.5, True), (875e9, True)])
+def test_t0_offset_over_one_second_warns(t0_offset, warns, write_prd):
+    path = write_prd(_zero_record())
+    for read in (read_product, read_headers):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            read(path, t0_offset=t0_offset)
+        mine = [w for w in caught if "more than 1 s" in str(w.message)]
+        assert len(mine) == warns and all(w.category is RuntimeWarning for w in mine)
+
+
+def test_info_counts_gaps_and_invalid_records(write_prd):
+    path = write_prd(*[_zero_record(time_tag_second_of_day=43200 + s, validity_flag=v)
+                       for s, v in ((0, 0), (1, 1), (5, 0))])
+    rows = dict(ln.strip().split(": ", 1) for ln in str(read_headers(path, t0_offset=0.0)).splitlines()[1:])
+    assert rows["gaps"] == "1 (largest dt 4.000000 s)" and rows["invalid_records"] == "1"
 
 
 def test_record_moved_by_hand_keeps_its_offset(write_prd):
