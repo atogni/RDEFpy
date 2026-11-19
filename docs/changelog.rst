@@ -1,6 +1,29 @@
 Changelog
 =========
 
+1.2.1 (2026-11-19)
+------------------
+
+Internal changes to reading and carrier extraction; same results, bit for
+bit, and same API.
+
+Carrier extraction
+   * ``extract_carrier``: blocks of up to 1024 samples are estimated up to
+     32 per task, sharing the kernel and FFT calls. ``memory_limit`` bounds
+     the tasks in flight.
+   * ``extract_carrier``: when a block raises, tasks not yet started are
+     cancelled and running ones are waited for.
+   * Compiled kernels: SPI evaluates its three stencil points in one pass;
+     the FrFT bank is filled column by column, without a scratch array.
+
+Product files (§5)
+   * Read-ahead from data sections of 256 KiB (was 512 KiB).
+   * Decoded records build their ``RecordData`` without re-checking it;
+     records of 501 to 16384 complex samples are built by the compiled
+     kernel.
+   * Header checks: the file-constant fields in one pass per field; the
+     NaN / Inf check ends early when every float field is finite.
+
 1.2.0 (2026-11-17)
 ------------------
 

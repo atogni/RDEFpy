@@ -140,14 +140,16 @@ decoded once. With the Cython extension the kernels run compiled and
 without the GIL; otherwise an equivalent NumPy path runs
 (:doc:`/installation`).
 
-``memory_limit`` bounds the blocks in flight, counting about 400 bytes per
+``memory_limit`` bounds the tasks in flight, counting about 400 bytes per
 block sample:
 
 .. code-block:: text
 
    max(1, min(2 * threads, memory_limit // (400 * samples per block)))
 
-The default, ``None``, is half of the memory the process can still take (2
-GiB if it cannot be read). A single block over the budget still runs,
-alone, with a :class:`RuntimeWarning`; ``memory_limit=math.inf`` ignores
-the budget. The estimates are the same whatever the limit.
+A task is one block, or up to 32 blocks of at most 1024 samples while
+they all fit the budget. The default, ``None``, is half of the memory the
+process can still take (2 GiB if it cannot be read). A single block over
+the budget still runs, alone, with a :class:`RuntimeWarning`;
+``memory_limit=math.inf`` ignores the budget. The estimates are the same
+whatever the limit.

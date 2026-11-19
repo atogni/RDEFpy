@@ -33,7 +33,7 @@ import math
 import os
 import warnings
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import numpy as np
 
@@ -54,6 +54,9 @@ _spi_refine = getattr(_cy, "spi_refine", None)
 _frft_refine = getattr(_cy, "frft_refine", None)
 _bank_fill = getattr(_cy, "frft_bank_fill", None)
 _argmax_abs2 = getattr(_cy, "argmax_abs2", None)
+# The same kernels over many blocks per call, for _frft_batch (short blocks).
+_many = tuple(getattr(_cy, k, None) for k in ("frft_bank_fill_many", "argmax_abs2_many", "frft_refine_many",
+                                               "spi_refine_many"))
 
 __all__ = ["CARRIER_DTYPE", "extract_carrier", "frft_frequency", "spi_frequency"]
 
@@ -68,6 +71,19 @@ _BYTES_PER_SAMPLE = 400
 # frft_frequency widens the rate search while the winner is at or beyond this
 # fraction of the current range.
 _WIDEN_GATE = 0.75
+
+# extract_carrier estimates blocks of at most _BATCH_MAX_SAMPLES samples
+# _BATCH_BLOCKS per task (_frft_batch). A short block is a dozen kernel and
+# FFT calls of a few microseconds each: one block per task, the threads spend
+# their time handing the interpreter lock to each other. Measured faster up
+# to 1000-sample blocks; from 2000 samples the larger FFT batches cost more
+# than the hand-offs.
+_BATCH_MAX_SAMPLES = 1024
+_BATCH_BLOCKS = 32
+# One shared FFT call returns at most this many bytes: larger batches leave
+# the cache and every row gets slower.
+_BATCH_FFT_BYTES = 256 << 10
+_BATCH_KWARGS = frozenset(("rate_center_hz_s", "rate_step_cells", "rate_iterations"))  # _frft_batch takes these
 
 
 def _free_bytes():
@@ -390,6 +406,119 @@ def frft_frequency(samples, sample_rate, max_rate_hz_s=None, rate_center_hz_s=0.
     return float(f_centre + 0.5 * mu * sample_rate), float(mu * sample_rate**2)
 
 
+def _bank_peaks(x64, requests, fft_len):
+    """``_bank_peak(x64[b], rates, step, None, fft_len)`` for each request ``(b, rates, step)``.
+
+    Compiled kernels only. Every request is cut into the same fills of at most
+    ``chunk`` rates as in ``_bank_peak``; the fills of all requests then share
+    the kernel and FFT calls, ``_BATCH_FFT_BYTES`` of FFT output at a time.
+    """
+    fill, argmax = _many[:2]
+    n = x64.shape[1]
+    chunk = max(1, min(64, 2**24 // fft_len))  # as _bank_peak
+    share = _BATCH_FFT_BYTES // (8 * fft_len)  # rows of several fills in one FFT call
+    best = [(-1.0, 0.0, 0)] * len(requests)
+    segs = [(q, b, i0, min(chunk, len(rates) - i0), float(rates[i0]), step)
+            for q, (b, rates, step) in enumerate(requests) for i0 in range(0, len(rates), chunk)]
+    s0 = 0
+    while s0 < len(segs):
+        s1, rows = s0 + 1, segs[s0][3]
+        while s1 < len(segs) and rows + segs[s1][3] <= share:
+            rows += segs[s1][3]
+            s1 += 1
+        part = segs[s0:s1]
+        m = np.array([s[3] for s in part], dtype=np.intp)
+        c = np.empty((rows, n), dtype=np.complex64)
+        fill(x64, np.array([s[1] for s in part], dtype=np.intp), np.array([s[4] for s in part]),
+             np.array([s[5] for s in part], dtype=float), m, c)
+        i, k, v = (a.tolist() for a in argmax(np.fft.fft(c, fft_len, axis=-1), m))
+        for (q, _, i0, _, _, _), i_s, k_s, v_s in zip(part, i, k, v):
+            if v_s > best[q][0]:  # in the order of _bank_peak's chunks
+                best[q] = (v_s, float(requests[q][1][i0 + i_s]), k_s)
+        s0 = s1
+    return best
+
+
+def _frft_batch(blocks, sample_rate, max_rate_hz_s=None, rate_center_hz_s=0.0, rate_range_hz_s=2.0,
+                rate_step_cells=2.0, zero_padding=3, rate_iterations=3):
+    """``frft_frequency`` on each of *blocks* (equal lengths): ``[(f_hz, fdot_hz_s), ...]``.
+
+    The same steps on the same numbers as ``frft_frequency`` with the compiled
+    kernels, so the same results bit for bit (tests/test_carrier.py), but the
+    blocks go through each step together: one kernel or FFT call serves the
+    whole batch, where one block alone needs a dozen. For ``extract_carrier``
+    on short blocks; needs the compiled kernels.
+    """
+    refine, spi = _many[2:]
+    x = np.ascontiguousarray(blocks, dtype=complex)
+    count, n = x.shape
+    _check_padding(zero_padding)
+    if not rate_step_cells > 0:
+        raise ValueError(f"rate_step_cells must be positive, got {rate_step_cells!r}")
+    out = [(np.nan, np.nan)] * count
+    if max_rate_hz_s == 0:  # no rate search: FFT peak, then SPI (spi_frequency)
+        mu = rate_center_hz_s / sample_rate**2
+        if mu:  # dechirped copies: not worth a batch
+            return [frft_frequency(b, sample_rate, 0, rate_center_hz_s, zero_padding=zero_padding) for b in x]
+        m = zero_padding * n
+        # |FFT| into rows with one spare column: the rows cannot be run as one
+        # long array, so each is computed as spi_frequency's 1-D array is.
+        spec = np.empty((count, m + 1))[:, :m]
+        rows = max(1, _BATCH_FFT_BYTES // (16 * m))
+        for r in range(0, count, rows):
+            np.abs(np.fft.fft(x[r : r + rows], m, axis=-1), out=spec[r : r + rows])
+        k_max = np.argmax(spec, axis=1).tolist()
+        keep = [b for b in range(count) if spec[b, k_max[b]] > 0]
+        f_est = [k_max[b] / m if k_max[b] <= m // 2 else (k_max[b] - m) / m for b in keep]
+        if keep:
+            f = spi(x, np.array(keep, dtype=np.intp), np.array(f_est), float(m)).tolist()
+            for b, f_b in zip(keep, f):
+                f_centre = _fold(f_b) * sample_rate
+                if not np.isnan(f_centre):
+                    out[b] = (float(f_centre + 0.5 * mu * sample_rate), float(rate_center_hz_s))
+        return out
+    step = rate_step_cells / n**2  # from here on: frft_frequency, line by line
+    mu0 = rate_center_hz_s / sample_rate**2
+    cap = round((abs(max_rate_hz_s) / sample_rate**2 if max_rate_hz_s is not None else 0.75 / n) / step)
+    J0 = min(max(1, round(abs(rate_range_hz_s) / sample_rate**2 / step)), cap)
+    fft_len = zero_padding * n
+    x64 = x.astype(np.complex64)
+    rates = mu0 + step * np.arange(-J0, J0 + 1)
+    best = _bank_peaks(x64, [(b, rates, step) for b in range(count)], fft_len)
+    J, outer = [J0] * count, {}
+    while True:
+        requests = []
+        for b in range(count):
+            Jb = J[b]
+            if Jb and abs(round((best[b][1] - mu0) / step)) >= _WIDEN_GATE * Jb and Jb < cap:
+                J[b] = Jn = min(2 * Jb, cap)
+                for side in (-1, 1):
+                    if (Jb, side) not in outer:
+                        outer[Jb, side] = mu0 + side * step * np.arange(Jb + 1, Jn + 1)
+                    requests.append((b, outer[Jb, side], side * step))
+        if not requests:
+            break
+        for (b, _, _), p in zip(requests, _bank_peaks(x64, requests, fft_len)):
+            if p[0] > best[b][0]:
+                best[b] = p
+    keep, mus, f0s = [], [], []
+    for b, (peak, mu, k_star) in enumerate(best):
+        if not peak > 0:  # all-zero or non-finite block: no carrier
+            continue
+        if J[b] and abs(round((mu - mu0) / step)) == J[b]:  # still on the edge at the cap
+            warnings.warn(f"best trial rate is the outermost one, {rate_center_hz_s:g} +- {J[b] * step * sample_rate**2:.4g} "
+                          "Hz/s: the true rate may lie beyond max_rate_hz_s", RuntimeWarning, stacklevel=2)
+        keep.append(b)
+        mus.append(mu)
+        f0s.append(k_star / fft_len if k_star <= fft_len // 2 else (k_star - fft_len) / fft_len)
+    if keep:
+        nu, mu = refine(x, np.array(keep, dtype=np.intp), np.array(mus), np.array(f0s), float(fft_len), step,
+                        rate_iterations)
+        for b, nu_b, mu_b in zip(keep, nu.tolist(), mu.tolist()):
+            out[b] = (float(nu_b * sample_rate + 0.5 * mu_b * sample_rate), float(mu_b * sample_rate**2))
+    return out
+
+
 def extract_carrier(pf, integration_time, max_rate_hz_s=None, rate_range_hz_s=2.0, zero_padding=3, start_epoch=None,
                     whole_second=False, memory_limit=None, **frft_kwargs):
     """Carrier frequency before downconversion of a product file, one value per block [Hz].
@@ -470,13 +599,14 @@ def extract_carrier(pf, integration_time, max_rate_hz_s=None, rate_range_hz_s=2.
         The samples are neither shifted nor interpolated: only the
         estimates are carried over dt.
     :param memory_limit: Memory budget for the blocks in flight [bytes].
-        Each costs about 400 bytes per block sample, so at most
-        min(2 * threads, memory_limit // (400 n)) blocks run at once, at
-        least 1. None (default): half of the memory the process can still
-        take (the smallest of free RAM, cgroup limit minus usage and
-        RLIMIT_AS minus the address space in use; 2 GiB if none can be
-        read). A single block over the budget runs alone, with a
-        RuntimeWarning. ``math.inf``: no limit, 2 * threads in flight, no
+        Each costs about 400 bytes per block sample. At most
+        min(2 * threads, memory_limit // (400 n)) tasks are in flight, at
+        least 1; a task is one block, or for blocks of up to 1024 samples
+        up to 32 blocks while all of them fit the budget. None (default):
+        half of the memory the process can still take (the smallest of free
+        RAM, cgroup limit minus usage and RLIMIT_AS minus the address space
+        in use; 2 GiB if none can be read). A single block over the budget runs alone, with a
+        RuntimeWarning. ``math.inf``: no limit, 2 * threads tasks in flight, no
         warning. The results do not depend on it.
     :param frft_kwargs: Passed to ``frft_frequency``.
     :return: Structured array, one row per block, fields ``time``,
@@ -528,58 +658,78 @@ def extract_carrier(pf, integration_time, max_rate_hz_s=None, rate_range_hz_s=2.
     for name in CARRIER_DTYPE.names[1:]:
         c[name] = np.nan
 
-    def estimate(b, blk, dc, dt):  # one block; writes only row b; dt: tag shift [s] (whole_second)
-        f, rate = frft_frequency(blk, fs, max_rate_hz_s, rate_range_hz_s=rate_range_hz_s, zero_padding=zero_padding,
-                                 **frft_kwargs)
-        f += rate * dt  # the fitted chirp, carried to the grid tag
-        c[b] = c["time"][b], dc + f, f, rate, dc
+    def estimate(items):  # one task: (b, block, dc, dt) each; writes only rows b; dt: tag shift [s] (whole_second)
+        if per == 1:
+            found = [frft_frequency(items[0][1], fs, max_rate_hz_s, rate_range_hz_s=rate_range_hz_s,
+                                    zero_padding=zero_padding, **frft_kwargs)]
+        else:  # short blocks: the same estimates, the kernel calls shared
+            found = _frft_batch([it[1] for it in items], fs, max_rate_hz_s, rate_range_hz_s=rate_range_hz_s,
+                                zero_padding=zero_padding, **frft_kwargs)
+        for (b, _, dc, dt), (f, rate) in zip(items, found):
+            f += rate * dt  # the fitted chirp, carried to the grid tag
+            c[b] = c["time"][b], dc + f, f, rate, dc
 
-    # At most 2 per thread in flight, fewer if the memory budget says so.
+    # At most 2 tasks per thread in flight, fewer if the memory budget says so.
+    # A task is one block, or several short ones (see _BATCH_MAX_SAMPLES).
     cap = 2 * ex._max_workers
+    per = 1
+    if None not in (_spi_refine, _frft_refine, _bank_fill, _argmax_abs2, *_many) and _BATCH_KWARGS.issuperset(frft_kwargs):
+        per = _BATCH_BLOCKS if n <= _BATCH_MAX_SAMPLES else 1
     if not (memory_limit is not None and math.isinf(memory_limit)):
         budget = _free_bytes() // 2 if memory_limit is None else memory_limit
         need = _BYTES_PER_SAMPLE * n
         cap = max(1, min(cap, int(budget // need)))
+        per = max(1, min(per, int(budget // need) // cap))  # all the tasks' blocks within the budget
         if need > budget:
             warnings.warn(f"one block (integration_time {n / fs:g} s at {fs:g} Hz) needs about {need / 1e9:.2f} GB, over "
                           f"the memory budget of {budget / 1e9:.2f} GB: running one block at a time. Use a shorter "
                           f"integration_time, or memory_limit=math.inf to ignore the budget", RuntimeWarning,
                           stacklevel=2)
-    pending = deque()
-    # One pass, each record decoded once: blocks fill from consecutive records.
-    parts, filled, gap, dc_int, b, T, dt = [], 0, False, 0.0, 0, n / fs, 0.0
-    for k, rec in enumerate(recs):
-        if filled and k:  # the open block continues into this record
-            t0, t1 = _record_epoch(recs[k - 1].header), _record_epoch(rec.header)
-            gap |= t0 is None or t1 is None or abs((t1 - t0) / np.timedelta64(1, "s") - 1.0) > 1e-6
-        x = rec.read_samples()
-        pos, skip = skip, 0
-        while pos < len(x) and b < n_blocks:
-            if not filled:  # block b starts here: tag its midpoint t0 + T/2
-                c["time"][b] = rec.header.timetag + np.timedelta64(round((2 * pos + n) * 1e9 / (2 * fs)), "ns")
-                if whole_second:  # nearest grid tag; dt = grid - samples' midpoint
-                    rel = (c["time"][b] - grid) / np.timedelta64(1, "ns") - 0.5e9 * T  # from the grid start
-                    k_grid = round(rel / (1e9 * T))
-                    c["time"][b] = grid + np.timedelta64(round((k_grid + 0.5) * 1e9 * T), "ns")
-                    dt = ((c["time"][b] - grid) / np.timedelta64(1, "ns") - 0.5e9 * T - rel) / 1e9
-            take = min(n - filled, len(x) - pos)
-            parts.append(x[pos : pos + take])
-            gap |= bool(rec.header.validity_flag)  # nonzero: error code (Table 5-1): NaN
-            # Integral of f_DC (§5.2.6) over this piece: 3-point Gauss-Legendre,
-            # exact for f_DC (quadratic in record time); origin per pf.t0_offset.
-            # whole_second: the block's two ends move by dt, record boundaries inside it stay
-            ta = pos / fs + (dt if filled == 0 else 0.0)
-            tb = (pos + take) / fs + (dt if filled + take == n else 0.0)
-            tq = 0.5 * (ta + tb) + 0.5 * (tb - ta) * _GL_X + _origin_offset(rec.header, pf.t0_offset)  # from t0
-            dc_int += 0.5 * (tb - ta) * float(np.sum(_GL_W * _downconv_hz(rec.header, tq)))
-            filled, pos = filled + take, pos + take
-            if filled == n:
-                if not gap:  # no interpolation across a gap: NaN
-                    blk = parts[0] if len(parts) == 1 else np.concatenate(parts)
-                    pending.append(ex.submit(estimate, b, blk, dc_int / T, dt))  # mean f_DC
-                    while len(pending) >= cap:
-                        pending.popleft().result()
-                parts, filled, gap, dc_int, b = [], 0, False, 0.0, b + 1
-    for fut in pending:
-        fut.result()
+    pending, items = deque(), []
+    try:
+        # One pass, each record decoded once: blocks fill from consecutive records.
+        parts, filled, gap, dc_int, b, T, dt = [], 0, False, 0.0, 0, n / fs, 0.0
+        for k, rec in enumerate(recs):
+            if filled and k:  # the open block continues into this record
+                t0, t1 = _record_epoch(recs[k - 1].header), _record_epoch(rec.header)
+                gap |= t0 is None or t1 is None or abs((t1 - t0) / np.timedelta64(1, "s") - 1.0) > 1e-6
+            x = rec.read_samples()
+            pos, skip = skip, 0
+            while pos < len(x) and b < n_blocks:
+                if not filled:  # block b starts here: tag its midpoint t0 + T/2
+                    c["time"][b] = rec.header.timetag + np.timedelta64(round((2 * pos + n) * 1e9 / (2 * fs)), "ns")
+                    if whole_second:  # nearest grid tag; dt = grid - samples' midpoint
+                        rel = (c["time"][b] - grid) / np.timedelta64(1, "ns") - 0.5e9 * T  # from the grid start
+                        k_grid = round(rel / (1e9 * T))
+                        c["time"][b] = grid + np.timedelta64(round((k_grid + 0.5) * 1e9 * T), "ns")
+                        dt = ((c["time"][b] - grid) / np.timedelta64(1, "ns") - 0.5e9 * T - rel) / 1e9
+                take = min(n - filled, len(x) - pos)
+                parts.append(x[pos : pos + take])
+                gap |= bool(rec.header.validity_flag)  # nonzero: error code (Table 5-1): NaN
+                # Integral of f_DC (§5.2.6) over this piece: 3-point Gauss-Legendre,
+                # exact for f_DC (quadratic in record time); origin per pf.t0_offset.
+                # whole_second: the block's two ends move by dt, record boundaries inside it stay
+                ta = pos / fs + (dt if filled == 0 else 0.0)
+                tb = (pos + take) / fs + (dt if filled + take == n else 0.0)
+                tq = 0.5 * (ta + tb) + 0.5 * (tb - ta) * _GL_X + _origin_offset(rec.header, pf.t0_offset)  # from t0
+                dc_int += 0.5 * (tb - ta) * float(np.sum(_GL_W * _downconv_hz(rec.header, tq)))
+                filled, pos = filled + take, pos + take
+                if filled == n:
+                    if not gap:  # no interpolation across a gap: NaN
+                        blk = parts[0] if len(parts) == 1 else np.concatenate(parts)
+                        items.append((b, blk, dc_int / T, dt))  # mean f_DC
+                        if len(items) == per:
+                            pending.append(ex.submit(estimate, items))
+                            items = []
+                            while len(pending) >= cap:
+                                pending.popleft().result()
+                    parts, filled, gap, dc_int, b = [], 0, False, 0.0, b + 1
+        if items:
+            pending.append(ex.submit(estimate, items))
+        for fut in pending:
+            fut.result()
+    finally:  # an error: drop the queued tasks, wait for the running ones
+        for fut in pending:
+            fut.cancel()
+        wait(pending)
     return c

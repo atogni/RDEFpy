@@ -107,6 +107,10 @@ _FLOAT_FIELDS = (
 )
 
 
+# c1, c2, c3: all NaN is DSN 0222's Millisecond Predict mode (see _out_of_range).
+_C123 = tuple(f"channel_phase_polynomial_coefficient_{k}" for k in (1, 2, 3))
+
+
 def _byte_tables(bits: int) -> tuple[np.ndarray, np.ndarray]:
     """
     Decode tables for the sub-byte sample sizes (4, 2, 1 bits).
@@ -210,10 +214,14 @@ def _out_of_range(h: dict) -> list[str]:
         bad.append("  - sample_rate: 0 (a record holds one second of data, §5.1.1)")
     # c1, c2, c3 ALL NaN is DSN 0222's Millisecond Predict mode (only the
     # accumulated phase is valid): accepted.  Any other NaN or Inf is not.
-    c123 = [f"channel_phase_polynomial_coefficient_{k}" for k in (1, 2, 3)]
-    ms_predict = all(math.isnan(h[f]) for f in c123)
     for f in _FLOAT_FIELDS:
-        if ms_predict and f in c123:
+        if not math.isfinite(h[f]):
+            break
+    else:  # every float finite, the usual header: nothing more to report
+        return bad
+    ms_predict = all(math.isnan(h[f]) for f in _C123)
+    for f in _FLOAT_FIELDS:
+        if ms_predict and f in _C123:
             continue
         if not math.isfinite(h[f]):
             bad.append(f"  - {f} (§5.2.4: NaN, -Inf and +Inf not supported)")

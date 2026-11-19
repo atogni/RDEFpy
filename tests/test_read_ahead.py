@@ -94,8 +94,8 @@ def test_reference_decode_agrees_with_the_transcription():
 
 
 def test_thresholds_are_the_measured_ones():
-    """512 KiB read-ahead, 8 MiB parallel read: changing either is a deliberate act."""
-    assert reader._READ_AHEAD_MIN_BYTES == 512 * 1024
+    """256 KiB read-ahead, 8 MiB parallel read: changing either is a deliberate act."""
+    assert reader._READ_AHEAD_MIN_BYTES == 256 * 1024
     assert reader._PARALLEL_READ_MIN_BYTES == 8 * 1024 * 1024
     assert reader._READ_AHEAD_MIN_BYTES < reader._PARALLEL_READ_MIN_BYTES
 
@@ -167,7 +167,7 @@ def test_the_guess_past_num_records_is_not_handed_to_another_record(decode_path,
 # =============================================================================
 
 
-@pytest.mark.parametrize("size, ahead", [(N, True), (N - 4, False)], ids=["512KiB", "512KiB-4"])
+@pytest.mark.parametrize("size, ahead", [(N, True), (N - 4, False)], ids=["256KiB", "256KiB-4"])
 def test_read_ahead_starts_at_exactly_the_threshold(size, ahead, write_prd, ahead_reads, readahead):
     sizes = [size] * 4
     path, datas = _file(write_prd, sizes)

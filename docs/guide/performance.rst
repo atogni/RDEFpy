@@ -46,7 +46,7 @@ below 8.
 Decodes and complex builds of at least 4 million samples are split, and
 data sections of at least 8 MiB are read in parallel slices; smaller records
 run in the calling thread. When records are read one after another in file
-order, the next data section of at least 512 KiB is read ahead on a
+order, the next data section of at least 256 KiB is read ahead on a
 background thread while the current one is decoded: in our measurements
 this made a full decode of records from 512 KiB 20-40 % faster, with the
 file already in the operating system's cache.
@@ -78,8 +78,8 @@ to complex samples (``rec.read_samples()``, the decode
 :func:`rdefpy.extract_carrier` runs; integer I/Q for the VLBI file), and
 the time :func:`rdefpy.extract_carrier` then adds (1 s blocks, ±10 Hz/s,
 default ``memory_limit``; not run on the VLBI file, "none"). Best of 3
-runs, files in the OS cache, same machine and versions,
-RDEFpy 1.1.0.
+runs, cold cache (each run reads a fresh copy of the file, never in the OS
+cache), same machine, Python 3.12.15, NumPy 2.5.5, RDEFpy 1.2.1.
 
 .. image:: ../cases.png
    :alt: Cython vs pure NumPy

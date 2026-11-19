@@ -658,6 +658,24 @@ class RecordData:
         self._i = i_arr
         self._q = q_arr
 
+    @classmethod
+    def _decoded(cls, sample_size: int, sample_rate: int, i: np.ndarray, q: np.ndarray,
+                 complex_dtype: np.dtype) -> RecordData:
+        """
+        The object ``RecordData(sample_size, sample_rate, i, q,
+        complex_dtype=complex_dtype)`` builds, without its checks: for the
+        reader, whose decoders return 1-D arrays of equal length in the
+        storage dtype of a sample size already validated.  One per record.
+        """
+        self = cls.__new__(cls)
+        self.sample_size = sample_size
+        self.sample_rate = sample_rate
+        self.complex_dtype = complex_dtype
+        self.dtype = i.dtype.type
+        self._i = i
+        self._q = q
+        return self
+
     # ---- basic --------------------------------------------------------
 
     def __len__(self) -> int:
@@ -764,7 +782,13 @@ class RecordData:
     def _fill_complex(self, out: np.ndarray) -> np.ndarray:
         """Write ``I + jQ`` into *out* (complex, same length) and return it."""
         i, q = self._pair()
-        if i.shape[0] < _utils._THREADED_MIN_SAMPLES:
+        if 500 < i.shape[0] <= 16384 and _iq_to_complex is not None and i.flags.c_contiguous and q.flags.c_contiguous:
+            # NumPy releases the GIL around each store of more than 500
+            # elements, and with other threads busy (extract_carrier) getting
+            # it back costs far more than these few microseconds.  The kernel
+            # keeps it at this size (16384: unpack_cyth._KEEP_GIL).  Same values.
+            _iq_to_complex(i, q, out.view(out.real.dtype))
+        elif i.shape[0] < _utils._THREADED_MIN_SAMPLES:
             out.real = i
             out.imag = q
         else:
@@ -1654,7 +1678,14 @@ class ProductFile:
     def _check_constant_fields(self) -> None:
         """Warn when a field that must be file-constant varies between records."""
         varying_fields = set()
+        headers = [r.header for r in self.records]
         for field in _FILE_CONSTANT_FIELDS:
+            # The usual file: every record holds the first one's value (the
+            # same object or an equal one), so nothing varies.  A NaN or a
+            # None among them falls through to the full comparison below.
+            vals = list(map(operator.attrgetter(field), headers))
+            if not vals or vals.count(vals[0]) == len(vals):
+                continue
             values = [
                 _same_key(getattr(r.header, field))
                 for r in self.records

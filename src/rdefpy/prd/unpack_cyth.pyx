@@ -40,7 +40,6 @@ import numpy as np
 cimport numpy as cnp
 from libc.math cimport M_PI, cos, floor, hypot, log, sin, fabs
 from libc.stdint cimport int8_t, int16_t, int32_t, uint8_t, uint16_t, uint32_t
-from libc.stdlib cimport free, malloc
 
 from rdefpy._utils import _in_chunks
 from rdefpy.prd._binary import _BYTE_TABLES
@@ -236,6 +235,12 @@ cpdef void unpack_iq_1_cython(
 # I/Q -> complex: one interleaving pass
 # =============================================================================
 
+# Calls on at most this many samples keep the GIL: they take a few
+# microseconds, less than handing the GIL to another thread and waiting to
+# get it back.
+cdef enum:
+    _KEEP_GIL = 16384
+
 ctypedef fused iq_t:
     int8_t
     int16_t
@@ -257,11 +262,17 @@ def iq_to_complex(const iq_t[::1] i, const iq_t[::1] q, re_t[::1] out):
     exact in float32 and float64), with each cache line written once.
     Used on thread chunks of large records, where it beats NumPy's two
     strided stores; on one thread page faults dominate and it does not.
+    Also used on records of 501 to _KEEP_GIL samples, keeping the GIL.
     """
     cdef Py_ssize_t n = i.shape[0]
     cdef Py_ssize_t k
     if q.shape[0] != n or out.shape[0] != 2 * n:
         raise ValueError("iq_to_complex: length mismatch")
+    if n <= _KEEP_GIL:  # a few microseconds: see _KEEP_GIL
+        for k in range(n):
+            out[2 * k] = <re_t>i[k]
+            out[2 * k + 1] = <re_t>q[k]
+        return
     with nogil:
         for k in range(n):
             out[2 * k] = <re_t>i[k]
@@ -469,17 +480,101 @@ cdef double _chirp_dtft_mag(const double complex* x, Py_ssize_t n, double mu, do
     return hypot(ar, ai)
 
 
+cdef void _chirp_dtft_mag3(const double complex* x, Py_ssize_t n, double mu0, double f0, double mu1, double f1,
+                           double mu2, double f2, double* mag) noexcept nogil:
+    """mag[j] = _chirp_dtft_mag(x, n, mu_j, f_j), j = 0, 1, 2, in one pass over x.
+
+    Each point takes exactly the operations of _chirp_dtft_mag, in the same
+    order, so the three values are the same bit for bit.  The phasor recursion
+    is a serial dependency chain; three independent chains overlap in the CPU.
+    """
+    cdef double c = (n - 1) / 2.0
+    cdef double u, fk, ph, tr, xr, xi
+    cdef double ar0 = 0.0, ai0 = 0.0, pr0, pi0, qr0, qi0, wr0, wi0
+    cdef double ar1 = 0.0, ai1 = 0.0, pr1, pi1, qr1, qi1, wr1, wi1
+    cdef double ar2 = 0.0, ai2 = 0.0, pr2, pi2, qr2, qi2, wr2, wi2
+    cdef Py_ssize_t k, k0 = 0, k1
+    wr0 = cos(-2.0 * M_PI * mu0)
+    wi0 = sin(-2.0 * M_PI * mu0)
+    wr1 = cos(-2.0 * M_PI * mu1)
+    wi1 = sin(-2.0 * M_PI * mu1)
+    wr2 = cos(-2.0 * M_PI * mu2)
+    wi2 = sin(-2.0 * M_PI * mu2)
+    while k0 < n:
+        k1 = k0 + _RESYNC
+        if k1 > n:
+            k1 = n
+        u = k0 - c
+        fk = f0 * k0
+        fk -= floor(fk)
+        ph = -M_PI * mu0 * u * u - 2.0 * M_PI * fk
+        pr0 = cos(ph)
+        pi0 = sin(ph)
+        ph = -M_PI * mu0 * (2.0 * u + 1.0) - 2.0 * M_PI * f0
+        qr0 = cos(ph)
+        qi0 = sin(ph)
+        fk = f1 * k0
+        fk -= floor(fk)
+        ph = -M_PI * mu1 * u * u - 2.0 * M_PI * fk
+        pr1 = cos(ph)
+        pi1 = sin(ph)
+        ph = -M_PI * mu1 * (2.0 * u + 1.0) - 2.0 * M_PI * f1
+        qr1 = cos(ph)
+        qi1 = sin(ph)
+        fk = f2 * k0
+        fk -= floor(fk)
+        ph = -M_PI * mu2 * u * u - 2.0 * M_PI * fk
+        pr2 = cos(ph)
+        pi2 = sin(ph)
+        ph = -M_PI * mu2 * (2.0 * u + 1.0) - 2.0 * M_PI * f2
+        qr2 = cos(ph)
+        qi2 = sin(ph)
+        for k in range(k0, k1):
+            xr = x[k].real
+            xi = x[k].imag
+            ar0 += xr * pr0 - xi * pi0
+            ai0 += xr * pi0 + xi * pr0
+            tr = pr0 * qr0 - pi0 * qi0
+            pi0 = pr0 * qi0 + pi0 * qr0
+            pr0 = tr
+            tr = qr0 * wr0 - qi0 * wi0
+            qi0 = qr0 * wi0 + qi0 * wr0
+            qr0 = tr
+            ar1 += xr * pr1 - xi * pi1
+            ai1 += xr * pi1 + xi * pr1
+            tr = pr1 * qr1 - pi1 * qi1
+            pi1 = pr1 * qi1 + pi1 * qr1
+            pr1 = tr
+            tr = qr1 * wr1 - qi1 * wi1
+            qi1 = qr1 * wi1 + qi1 * wr1
+            qr1 = tr
+            ar2 += xr * pr2 - xi * pi2
+            ai2 += xr * pi2 + xi * pr2
+            tr = pr2 * qr2 - pi2 * qi2
+            pi2 = pr2 * qi2 + pi2 * qr2
+            pr2 = tr
+            tr = qr2 * wr2 - qi2 * wi2
+            qi2 = qr2 * wi2 + qi2 * wr2
+            qr2 = tr
+        k0 = k1
+    mag[0] = hypot(ar0, ai0)
+    mag[1] = hypot(ar1, ai1)
+    mag[2] = hypot(ar2, ai2)
+
+
 cdef double _spi(const double complex* x, Py_ssize_t n, double mu, double f, double m,
                  int max_iterations, double threshold) noexcept nogil:
     """SPI of |DTFT| of the block dechirped at mu, from seed f [cycles/sample]; m = padded FFT length."""
     cdef int i
     cdef double delta, f_prev, x1, x2, x3, denom
+    cdef double mag[3]
     for i in range(1, max_iterations + 1):
         f_prev = f
         delta = 1.0 / ((1 << i) * m)
-        x1 = _chirp_dtft_mag(x, n, mu, f - delta)
-        x2 = _chirp_dtft_mag(x, n, mu, f)
-        x3 = _chirp_dtft_mag(x, n, mu, f + delta)
+        _chirp_dtft_mag3(x, n, mu, f - delta, mu, f, mu, f + delta, mag)
+        x1 = mag[0]
+        x2 = mag[1]
+        x3 = mag[2]
         if x2 < x3:  # re-centre so x2 is the largest of the three
             f += delta
             x1 = x2
@@ -513,6 +608,39 @@ def spi_refine(const double complex[::1] x, double mu, double f, double m,
     return f
 
 
+cdef void _refine(const double complex* p, Py_ssize_t n, double mu, double f, double m, double step,
+                  int rate_iterations, int max_iterations, double threshold,
+                  double* out_f, double* out_mu) noexcept nogil:
+    cdef int it
+    cdef double nu0, h, y1, y2, y3, denom
+    cdef double mag[3]
+    nu0 = _spi(p, n, mu, f, m, max_iterations, threshold)
+    for it in range(1, rate_iterations + 1):
+        h = step / (1 << it)
+        _chirp_dtft_mag3(p, n, mu - h, nu0, mu, nu0, mu + h, nu0, mag)
+        y1 = 2.0 * log(mag[0])
+        y2 = 2.0 * log(mag[1])
+        y3 = 2.0 * log(mag[2])
+        if y3 > y2:
+            mu += h
+            y1 = y2
+            y2 = y3
+            y3 = _log_power(p, n, mu + h, nu0)
+        elif y1 > y2:
+            mu -= h
+            y3 = y2
+            y2 = y1
+            y1 = _log_power(p, n, mu - h, nu0)
+        denom = y1 + y3 - 2.0 * y2
+        if denom < 0:
+            mu -= 0.5 * h * (y3 - y1) / denom
+    # From the padded-FFT bin nearest nu0 (the NumPy path starts from a
+    # new padded-FFT peak at the final rate): started on nu0 itself, the
+    # first, widest step can fall under the threshold.
+    out_f[0] = _spi(p, n, mu, floor(nu0 * m + 0.5) / m, m, max_iterations, threshold)
+    out_mu[0] = mu
+
+
 def frft_refine(const double complex[::1] x, double mu, double f, double m, double step,
                 int rate_iterations, int max_iterations=5, double threshold=1e-12):
     """Steps 2-3 of frft_frequency from the bank's (mu, f): returns (f_centre, mu).
@@ -522,81 +650,150 @@ def frft_refine(const double complex[::1] x, double mu, double f, double m, doub
     nearest the first SPI).
     """
     cdef Py_ssize_t n = x.shape[0]
-    cdef const double complex* p
-    cdef int it
-    cdef double nu0, h, y1, y2, y3, denom
     if n == 0:
         raise ValueError("frft_refine: empty x")
-    p = &x[0]
     with nogil:
-        nu0 = _spi(p, n, mu, f, m, max_iterations, threshold)
-        for it in range(1, rate_iterations + 1):
-            h = step / (1 << it)
-            y1 = _log_power(p, n, mu - h, nu0)
-            y2 = _log_power(p, n, mu, nu0)
-            y3 = _log_power(p, n, mu + h, nu0)
-            if y3 > y2:
-                mu += h
-                y1 = y2
-                y2 = y3
-                y3 = _log_power(p, n, mu + h, nu0)
-            elif y1 > y2:
-                mu -= h
-                y3 = y2
-                y2 = y1
-                y1 = _log_power(p, n, mu - h, nu0)
-            denom = y1 + y3 - 2.0 * y2
-            if denom < 0:
-                mu -= 0.5 * h * (y3 - y1) / denom
-        # From the padded-FFT bin nearest nu0 (the NumPy path starts from a
-        # new padded-FFT peak at the final rate): started on nu0 itself, the
-        # first, widest step can fall under the threshold.
-        f = _spi(p, n, mu, floor(nu0 * m + 0.5) / m, m, max_iterations, threshold)
+        _refine(&x[0], n, mu, f, m, step, rate_iterations, max_iterations, threshold, &f, &mu)
     return f, mu
+
+
+cdef void _bank_fill(const float complex* x, Py_ssize_t n, double rate0, double step,
+                     float complex* out, Py_ssize_t rows) noexcept nogil:
+    cdef Py_ssize_t i, k, m
+    cdef double c = (n - 1) / 2.0, u, br, bi, sr = 1.0, si = 0.0, tr
+    # Column by column: the phasor of sample k starts at the base rate and
+    # advances one step per row.  (k - c)^2 is the same number, exactly, at
+    # k and at m = n - 1 - k (k - c and m - c are exact and opposite), so
+    # one cos/sin set serves both columns.
+    for k in range((n + 1) // 2):
+        m = n - 1 - k
+        u = (k - c) * (k - c)
+        br = cos(-M_PI * rate0 * u)
+        bi = sin(-M_PI * rate0 * u)
+        if rows > 1:  # the step phasor only takes a row to the next
+            sr = cos(-M_PI * step * u)
+            si = sin(-M_PI * step * u)
+        for i in range(rows):
+            out[i * n + k] = <float complex> ((x[k].real * br - x[k].imag * bi) + (x[k].real * bi + x[k].imag * br) * 1j)
+            out[i * n + m] = <float complex> ((x[m].real * br - x[m].imag * bi) + (x[m].real * bi + x[m].imag * br) * 1j)
+            if i + 1 < rows:
+                tr = br * sr - bi * si
+                bi = br * si + bi * sr
+                br = tr
 
 
 def frft_bank_fill(const float complex[::1] x, double rate0, double step, float complex[:, ::1] out):
     """out[i, k] = x[k] exp(-j pi (rate0 + i step) (k - c)^2), c = (n-1)/2."""
-    cdef Py_ssize_t rows = out.shape[0], n = out.shape[1], i, k
-    cdef double c = (n - 1) / 2.0, u, br, bi, sr, si, tr
-    cdef double* st
+    cdef Py_ssize_t rows = out.shape[0], n = out.shape[1]
     if x.shape[0] != n:
         raise ValueError("x and out rows differ in length")
-    st = <double*> malloc(4 * n * sizeof(double))  # per sample: base phasor, step phasor
-    if st == NULL:
-        raise MemoryError()
+    if rows == 0 or n == 0:
+        return
     with nogil:
-        for k in range(n):
-            u = (k - c) * (k - c)
-            st[4 * k] = cos(-M_PI * rate0 * u)
-            st[4 * k + 1] = sin(-M_PI * rate0 * u)
-            st[4 * k + 2] = cos(-M_PI * step * u)
-            st[4 * k + 3] = sin(-M_PI * step * u)
-        for i in range(rows):
-            for k in range(n):
-                br = st[4 * k]
-                bi = st[4 * k + 1]
-                out[i, k] = <float complex> ((x[k].real * br - x[k].imag * bi) + (x[k].real * bi + x[k].imag * br) * 1j)
-                sr = st[4 * k + 2]
-                si = st[4 * k + 3]
-                tr = br * sr - bi * si
-                st[4 * k + 1] = br * si + bi * sr
-                st[4 * k] = tr
-    free(st)
+        _bank_fill(&x[0], n, rate0, step, &out[0, 0], rows)
+
+
+cdef void _argmax(const bank_t* a, Py_ssize_t rows, Py_ssize_t cols,
+                  Py_ssize_t* row, Py_ssize_t* col, double* peak) noexcept nogil:
+    cdef Py_ssize_t i, k, bi_ = 0, bk = 0
+    cdef double best = -1.0, v, re, im
+    for i in range(rows):
+        for k in range(cols):
+            re = a[i * cols + k].real
+            im = a[i * cols + k].imag
+            v = re * re + im * im
+            if v > best:
+                best = v
+                bi_ = i
+                bk = k
+    row[0] = bi_
+    col[0] = bk
+    peak[0] = best
 
 
 def argmax_abs2(bank_t[:, ::1] a):
     """(row, col, |a|^2) of the largest |a|^2, accumulated in double."""
-    cdef Py_ssize_t rows = a.shape[0], cols = a.shape[1], i, k, bi_ = 0, bk = 0
-    cdef double best = -1.0, v, re, im
-    with nogil:
-        for i in range(rows):
-            for k in range(cols):
-                re = a[i, k].real
-                im = a[i, k].imag
-                v = re * re + im * im
-                if v > best:
-                    best = v
-                    bi_ = i
-                    bk = k
+    cdef Py_ssize_t rows = a.shape[0], cols = a.shape[1], bi_ = 0, bk = 0
+    cdef double best = -1.0
+    if rows and cols:
+        with nogil:
+            _argmax(&a[0, 0], rows, cols, &bi_, &bk, &best)
     return bi_, bk, best
+
+
+# The same kernels over many blocks in one call (rdefpy.carrier._frft_batch):
+# short blocks then cost one GIL release per batch, not one per block and step.
+# Each block or segment gets exactly the single-block call above.
+
+def frft_bank_fill_many(const float complex[:, ::1] x, const Py_ssize_t[::1] block, const double[::1] rate0,
+                        const double[::1] step, const Py_ssize_t[::1] rows, float complex[:, ::1] out):
+    """frft_bank_fill(x[block[s]], rate0[s], step[s]) into the next rows[s] rows of out, for each segment s."""
+    cdef Py_ssize_t n = out.shape[1], segs = rows.shape[0], s, r = 0
+    if x.shape[1] != n or n == 0:
+        raise ValueError("x and out rows differ in length, or are empty")
+    if block.shape[0] != segs or rate0.shape[0] != segs or step.shape[0] != segs:
+        raise ValueError("one block, rate0, step and rows per segment")
+    for s in range(segs):
+        if rows[s] < 1 or not 0 <= block[s] < x.shape[0]:
+            raise ValueError("segment rows must be positive and blocks inside x")
+        r += rows[s]
+    if r != out.shape[0]:
+        raise ValueError(f"out has {out.shape[0]} rows, the segments need {r}")
+    with nogil:
+        r = 0
+        for s in range(segs):
+            _bank_fill(&x[block[s], 0], n, rate0[s], step[s], &out[r, 0], rows[s])
+            r += rows[s]
+
+
+def argmax_abs2_many(float complex[:, ::1] a, const Py_ssize_t[::1] rows):
+    """argmax_abs2 of each run of rows[s] consecutive rows of a: arrays (row within the run, col, |a|^2)."""
+    cdef Py_ssize_t cols = a.shape[1], segs = rows.shape[0], s, r = 0
+    for s in range(segs):
+        if rows[s] < 1:
+            raise ValueError("segment rows must be positive")
+        r += rows[s]
+    if r != a.shape[0] or cols == 0:
+        raise ValueError(f"a has {a.shape[0]} rows of {cols}, the segments need {r} non-empty rows")
+    row, col, peak = np.empty(segs, np.intp), np.empty(segs, np.intp), np.empty(segs, np.float64)
+    cdef Py_ssize_t[::1] row_v = row, col_v = col
+    cdef double[::1] peak_v = peak
+    with nogil:
+        r = 0
+        for s in range(segs):
+            _argmax(&a[r, 0], rows[s], cols, &row_v[s], &col_v[s], &peak_v[s])
+            r += rows[s]
+    return row, col, peak
+
+
+def spi_refine_many(const double complex[:, ::1] x, const Py_ssize_t[::1] block, const double[::1] f, double m):
+    """spi_refine(x[block[s]], 0.0, f[s], m) for each s: array of f [cycles/sample]."""
+    cdef Py_ssize_t n = x.shape[1], segs = block.shape[0], s
+    if n == 0 or f.shape[0] != segs:
+        raise ValueError("spi_refine_many: empty blocks, or not one f per block")
+    for s in range(segs):
+        if not 0 <= block[s] < x.shape[0]:
+            raise ValueError("blocks must be inside x")
+    out = np.empty(segs, np.float64)
+    cdef double[::1] out_v = out
+    with nogil:
+        for s in range(segs):
+            out_v[s] = _spi(&x[block[s], 0], n, 0.0, f[s], m, 5, 1e-12)
+    return out
+
+
+def frft_refine_many(const double complex[:, ::1] x, const Py_ssize_t[::1] block, const double[::1] mu,
+                     const double[::1] f, double m, double step, int rate_iterations):
+    """frft_refine(x[block[s]], mu[s], f[s], m, step, rate_iterations) for each s: arrays (f_centre, mu)."""
+    cdef Py_ssize_t n = x.shape[1], segs = block.shape[0], s
+    if n == 0 or f.shape[0] != segs or mu.shape[0] != segs:
+        raise ValueError("frft_refine_many: empty blocks, or not one mu and f per block")
+    for s in range(segs):
+        if not 0 <= block[s] < x.shape[0]:
+            raise ValueError("blocks must be inside x")
+    out_f, out_mu = np.empty(segs, np.float64), np.empty(segs, np.float64)
+    cdef double[::1] f_v = out_f, mu_v = out_mu
+    with nogil:
+        for s in range(segs):
+            _refine(&x[block[s], 0], n, mu[s], f[s], m, step, rate_iterations, 5, 1e-12, &f_v[s], &mu_v[s])
+    return out_f, out_mu

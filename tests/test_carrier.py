@@ -575,3 +575,78 @@ def test_iteration_counts_are_used(compiled, monkeypatch):
     assert spi_frequency(x, 1.0, convergence_threshold=1.0) == one
     assert frft_frequency(_chirp(0.7), 1000.0, rate_iterations=0)[1] == 0.0
     assert abs(frft_frequency(_chirp(0.7), 1000.0, rate_iterations=1)[1] - 0.7) > 1e-4  # default 3: 1e-9
+
+
+# ---- short blocks, several per task (_frft_batch) ----------------------------------
+
+
+def _noisy_blocks(n, count, seed):
+    """Chirps of assorted rates (some beyond the default range and the cap) in noise,
+    as integer-valued samples, plus a zero, a non-finite and a pure-noise block."""
+    rng = np.random.default_rng(seed)
+    k = np.arange(n) - (n - 1) / 2
+    blocks = []
+    for b in range(count):
+        f, r = rng.uniform(-0.5, 0.5), rng.choice([0.0, 0.7, -1.9, 2.5, -6.0, 37.0, -250.0]) / n**2
+        x = 3000 * np.exp(2j * np.pi * (f * k + 0.5 * r * k * k))
+        x += rng.choice([1.0, 3000.0, 30000.0]) * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
+        blocks.append(np.round(x))
+    blocks[1] = np.zeros(n, complex)
+    blocks[2] = np.where(np.arange(n) == n // 2, np.nan, blocks[2])
+    return blocks
+
+
+@pytest.mark.filterwarnings("ignore:invalid value encountered:RuntimeWarning")  # NumPy's, on the NaN block
+@pytest.mark.parametrize("kw", [dict(max_rate_hz_s=10.0), dict(), dict(max_rate_hz_s=0), dict(max_rate_hz_s=3.0),
+                                dict(max_rate_hz_s=300.0, rate_step_cells=1.0),  # > 64 rates: several fills
+                                dict(max_rate_hz_s=40.0, rate_center_hz_s=-5.0, rate_range_hz_s=7.0, zero_padding=2,
+                                     rate_iterations=5),
+                                dict(max_rate_hz_s=0, rate_center_hz_s=2.5), dict(max_rate_hz_s=0, zero_padding=1)],
+                         ids=str)
+@pytest.mark.parametrize("n, dtype", [(1000, complex), (256, np.complex64), (777, complex)])
+def test_blocks_estimated_in_a_batch_give_the_same_bits(n, dtype, kw):
+    """_frft_batch (extract_carrier on short blocks) must return, for every block,
+    exactly what frft_frequency returns for it alone, and warn as often."""
+    from rdefpy import carrier
+    if None in carrier._many:
+        pytest.skip("compiled kernels not built")
+    blocks = [b.astype(dtype) for b in _noisy_blocks(n, 40, n)]
+    with warnings.catch_warnings(record=True) as alone_w:
+        warnings.simplefilter("always")
+        alone = [frft_frequency(b, float(n), **kw) for b in blocks]
+    with warnings.catch_warnings(record=True) as batch_w:
+        warnings.simplefilter("always")
+        batch = carrier._frft_batch(blocks, float(n), **kw)
+    assert np.array(batch).tobytes() == np.array(alone).tobytes()
+    assert all(type(v) is float for pair in batch for v in pair)
+    outermost = [str(w.message) for w in alone_w if "outermost" in str(w.message)]
+    assert sorted(str(w.message) for w in batch_w if "outermost" in str(w.message)) == sorted(outermost)
+    assert np.isnan(batch[1]).all() and np.isnan(batch[2]).all() and np.isfinite(batch[3]).all()
+
+
+@pytest.mark.parametrize("kw", [dict(max_rate_hz_s=10.0), dict(max_rate_hz_s=0), dict(whole_second=True)], ids=str)
+@pytest.mark.parametrize("T", [1.0, 0.25, 0.7])
+def test_extract_carrier_does_not_depend_on_the_blocks_per_task(T, kw, write_prd, monkeypatch):
+    import math
+    from rdefpy import _utils, carrier
+    if None in carrier._many:
+        pytest.skip("compiled kernels not built")
+    pf = read_product(_chirp_file(write_prd, [*range(9), *range(11, 20)]))  # a gap: a NaN block at T = 0.7 s
+    calls, real = [], carrier._frft_batch
+
+    def spy(blocks, *a, **k):
+        calls.append(len(blocks))
+        return real(blocks, *a, **k)
+
+    monkeypatch.setattr(carrier, "_frft_batch", spy)
+    batched = extract_carrier(pf, T, memory_limit=math.inf, **kw)
+    assert calls and max(calls) > 1  # several blocks per task
+    room = 5 * 2 * _utils._THREADS * carrier._BYTES_PER_SAMPLE * round(T * FS)  # 5 blocks for each task in flight
+    few = extract_carrier(pf, T, memory_limit=room, **kw)
+    del calls[:]
+    extract_carrier(pf, 2.0, memory_limit=math.inf, **kw)  # 2000-sample blocks: one per task
+    assert not calls
+    monkeypatch.setattr(carrier, "_BATCH_BLOCKS", 1)
+    single = extract_carrier(pf, T, memory_limit=math.inf, **kw)
+    assert not calls  # one frft_frequency per block
+    assert batched.tobytes() == single.tobytes() == few.tobytes()

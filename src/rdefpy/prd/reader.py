@@ -109,8 +109,8 @@ _AUTO_LOAD_MAX_RATE_HZ = 1000
 _PARALLEL_READ_MIN_BYTES = 8 << 20
 # Data sections at least this large, read in file order, have the next
 # record's section read on a background thread while this one decodes.
-# 20-40% faster warm decode from 512 KiB, 2- and 16-bit.
-_READ_AHEAD_MIN_BYTES = 512 << 10
+# 256 KiB: also 100 kHz 16-bit sections (400 kB).
+_READ_AHEAD_MIN_BYTES = 256 << 10
 
 
 # =============================================================================
@@ -298,9 +298,12 @@ class _DiskSource:
             # keeps, so make it an error instead of a silent no-op.
             i.flags.writeable = False
             q.flags.writeable = False
-        return RecordData(
-            sample_size=header.sample_size,
-            sample_rate=header.sample_rate,
+        size, rate = header.sample_size, header.sample_rate
+        if type(size) is int and type(rate) is int:  # as read from the file: nothing to check or convert
+            return RecordData._decoded(size, rate, i, q, self.complex_dtype)
+        return RecordData(  # a header edited since
+            sample_size=size,
+            sample_rate=rate,
             i_samples=i,
             q_samples=q,
             complex_dtype=self.complex_dtype,
