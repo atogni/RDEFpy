@@ -39,6 +39,13 @@ pip install rdefpy
 pip install "rdefpy[browse]"    # with matplotlib, for rdefpy.browse
 ```
 
+or, in a [uv](https://docs.astral.sh/uv/) project:
+
+```
+uv add rdefpy
+uv add "rdefpy[browse]"
+```
+
 The prebuilt wheels include the Cython extension; a source build needs a C
 compiler, or installs the NumPy path only.
 
@@ -76,7 +83,7 @@ Togni, A., Malphrus, B., Arnold, B., Mayo, D., Sanchez-Net, M., & Asmar, S.
 Open-Source RDEF Software Compliant with CCSDS Standards. Poster, 14th
 General Meeting of the International VLBI Service for Geodesy and Astrometry
 (IVS GM2026), Würzburg.
-https://indico.astro.uni-wuerzburg.de/event/2/contributions/143/
+https://doi.org/10.5281/zenodo.20402520
 
 ## License
 

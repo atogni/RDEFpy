@@ -8,7 +8,7 @@ If RDEFpy helps your work, please cite the poster that introduced it:
    Navigation via Open-Source RDEF Software Compliant with CCSDS Standards.
    Poster, 14th General Meeting of the International VLBI Service for
    Geodesy and Astrometry (IVS GM2026), Würzburg.
-   https://indico.astro.uni-wuerzburg.de/event/2/contributions/143/
+   https://doi.org/10.5281/zenodo.20402520
 
 The carrier estimator in :func:`rdefpy.extract_carrier` is described in:
 

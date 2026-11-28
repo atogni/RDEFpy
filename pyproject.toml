@@ -8,7 +8,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Andrea Togni", email = "antogni@moreheadstate.edu" }]
 requires-python = ">=3.11"
 dependencies = ["numpy>=1.26"]
-keywords = ["CCSDS", "RDEF", "Delta-DOR", "DSN", "radio science", "open-loop"]
+keywords = ["CCSDS", "RDEF", "Raw Data Exchange Format", "Delta-DOR", "VLBI", "DSN", "radio science", "open-loop", "deep space navigation"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
